@@ -97,8 +97,9 @@ Per-project secrets: `printf %s "$VALUE" | bb machine env set NAME --project <pr
 | `apiKey` (secret) | the server's `INSTABOX_API_KEY` | `ibk_…` |
 | `template` | `agent-browser` | The free plan allows only this template |
 | `snapshotId` | empty | Create machines from a snapshot instead |
-| `zaiApiKey` (secret) | the server's `ZAI_API_KEY` | Given to the daemon as `ANTHROPIC_AUTH_TOKEN` (claude-code on Z.ai) and as `ZAI_API_KEY`. pi: pick `zai/<model>`, e.g. `zai/glm-5.2` (bb's model list does not show these). OpenCode: the plugin writes `~/.config/opencode/opencode.json` with a `zai-coding-plan` provider (`api.z.ai/api/coding/paas/v4`, key read from `$ZAI_API_KEY`, no secret in the file), so `acp-opencode` lists `zai-coding-plan/glm-5.3` etc. A user-owned opencode.json is left alone |
+| `zaiApiKey` (secret) | the server's `ZAI_API_KEY` | Given to the daemon as `ANTHROPIC_AUTH_TOKEN` (claude-code on Z.ai) and as `ZAI_API_KEY`. pi: pick `zai/<model>`, e.g. `zai/glm-5.2` (bb's model list does not show these). OpenCode: see `opencodeProviders` |
 | `agentSecrets` (secret) | empty | One-line JSON `{"NAME":"value",…}` added to every machine's bb daemon environment. Re-applied to running machines when it changes (their daemon restarts). For per-project values use `bb machine env set NAME --project <id>` |
+| `opencodeProviders` | Z.ai coding plan, zro, coralbricks, neuralwatt | JSON array `[{"id","name"?,"baseURL","keyEnv"}]` of OpenAI-compatible providers for OpenCode. On each machine the plugin calls `<baseURL>/models` with the key from `keyEnv` (from `zaiApiKey` or `agentSecrets`) and writes `~/.config/opencode/opencode.json` from the live list: `apiKey` is `{env:NAME}`, never the value. No key: skipped. A failed fetch keeps that provider's last list. A user-owned opencode.json is left alone. Refreshed on create, resume and any credential/provider setting change; when the file changes, running bb daemons restart so bb's model picker shows the new list. The coralbricks and neuralwatt `keyEnv` names are assumed, not verified |
 | `zaiBaseUrl` | `https://api.z.ai/api/anthropic` | |
 | `boxHubPort` | `38886` | Must match `machineServerUrl`; reload the plugin after changing it |
 
@@ -173,8 +174,9 @@ login, which bb passes to remote machines, or a `GH_TOKEN` machine variable.
 
 ## Tests
 
-`npm test` covers argv quoting, env-line injection, idempotent create and
-key-scoped cleanup. `npx tsc --noEmit -p .` checks the types. `bb plugin build .` builds the plugin.
+`npm test` covers argv quoting, env-line injection, idempotent create,
+key-scoped cleanup, and the OpenCode model sync against a fake `/models` server (key never
+written or shell-expanded, last list kept on a failed fetch, user file left alone). `npx tsc --noEmit -p .` checks the types. `bb plugin build .` builds the plugin.
 
 ## Live acceptance status
 
@@ -191,6 +193,7 @@ independently.
 | Pause from outside bb (stands in for the idle pause) → supervisor marks the host suspended → `bb thread tell` resumes it | Passed after a fix: the first run hung on a stale model-API socket; resume now closes outbound HTTP(S) connections |
 | `bb machine remove` → VM gone (API 404), tunnel processes and credentials removed | Passed (three runs) |
 | Basic snapshot (pi, OpenCode, claude-code, codex) → new machine → private repo cloned at GitHub HEAD → claude-code (`claude-sonnet-5-5` via Z.ai), pi (`zai/glm-5.2`) and OpenCode (`zai-coding-plan/glm-5.3`) threads, then suspend/resume and a follow-up turn on pi and OpenCode | Passed (all answers matched values computed independently) |
+| OpenCode models from the live `/models` list: 11 Z.ai models written on the box (key not in the file); `zai-coding-plan/glm-5.1` (not in any fixed list) answered on the existing runner and on a new one-step box, whose picker listed all of them | Passed |
 | `bb thread spawn --environment-provider instabox --provider acp-opencode --model zai-coding-plan/glm-5.3` → new box from the snapshot → private repo cloned → answer → `bb machine remove` | Passed (about 40 s to provision) |
 | `agentSecrets` changed → re-applied to running machines → visible to the agent | Passed (hash of the value matched) |
 

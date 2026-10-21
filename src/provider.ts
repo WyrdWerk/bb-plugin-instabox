@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { MachineBootstrapApi, MachineExecutor } from "@get-bb/plugin-sdk";
-import { agentEnvContent, agentEnvScript, hubHealthScript, identityResetScript, opencodeConfig, opencodeConfigScript, staleConnectionsScript, tunnelSetupScript } from "./box-scripts.ts";
+import { agentEnvContent, agentEnvScript, hubHealthScript, identityResetScript, type OpencodeProvider, opencodeSyncScript, staleConnectionsScript, tunnelSetupScript } from "./box-scripts.ts";
 import { InstaboxExecutor, runScript } from "./executor.ts";
 import { type InstaboxApi, isNotFound, isRunning, type Machine, type Operation, STOPPED_STATES, SUSPENDED_STATES } from "./instabox-api.ts";
 import type { TunnelManager } from "./tunnel.ts";
@@ -34,6 +34,8 @@ export interface ProviderConfig {
   snapshotId: string | null;
   /** KEY=value pairs for the bb daemon (agent credentials). */
   agentEnv: Record<string, string>;
+  /** OpenAI-compatible providers whose live model lists go into OpenCode's config on the machine. */
+  opencodeProviders: OpencodeProvider[];
 }
 
 /** Recorded before the create call so a crash in between can still be cleaned up. */
@@ -185,7 +187,13 @@ export class InstaboxMachineOps {
   async applyAgentEnv(machineId: string, signal: AbortSignal): Promise<string> {
     const c = await this.d.config();
     const executor = new InstaboxExecutor(c.api, machineId);
-    return lastLine(await runScript(executor, agentEnvScript(), signal, { stdin: agentEnvContent(c.agentEnv), what: "agent env" }));
+    const env = lastLine(await runScript(executor, agentEnvScript(), signal, { stdin: agentEnvContent(c.agentEnv), what: "agent env" }));
+    return `${env} ${await this.syncOpencode(c, executor, signal)}`;
+  }
+
+  /** Rebuild OpenCode's provider config from each provider's live /models (on the machine, with its keys). */
+  private async syncOpencode(c: ProviderConfig, executor: MachineExecutor, signal: AbortSignal): Promise<string> {
+    return lastLine(await runScript(executor, opencodeSyncScript(), signal, { stdin: JSON.stringify(c.opencodeProviders), what: "opencode config", timeoutMs: 120_000 }));
   }
 
   /** Box side of the tunnel plus the agent credentials. Idempotent. */
@@ -196,7 +204,8 @@ export class InstaboxMachineOps {
     const names = Object.keys(c.agentEnv);
     report.step(`Giving the bb daemon its agent credentials (${names.length ? names.join(", ") : "none configured"})`);
     report.log(lastLine(await runScript(executor, agentEnvScript(), signal, { stdin: agentEnvContent(c.agentEnv), what: "agent env" })));
-    if (c.agentEnv.ZAI_API_KEY) report.log(lastLine(await runScript(executor, opencodeConfigScript(), signal, { stdin: opencodeConfig(), what: "opencode config" })));
+    report.step("Fetching model lists for OpenCode");
+    report.log(await this.syncOpencode(c, executor, signal));
   }
 
   /** Open the hub-side tunnel and require the hub's /health from inside the box. */

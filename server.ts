@@ -10,7 +10,7 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { DEFAULT_API_URL, InstaboxApi, type FetchLike, isRunning } from "./src/instabox-api.ts";
 import { type AllocationIntent, InstaboxMachineOps, inputsSchema, PROVIDER_ID, type ProviderConfig, resourceSchema } from "./src/provider.ts";
 import { TunnelManager } from "./src/tunnel.ts";
-import { parseAgentSecrets } from "./src/box-scripts.ts";
+import { parseAgentSecrets, parseOpencodeProviders } from "./src/box-scripts.ts";
 
 const COMPOSITIONS = [
   {
@@ -63,6 +63,14 @@ export default async function plugin(bb: BbPluginApi) {
         'One-line JSON object of NAME → value, e.g. {"GH_TOKEN":"…","OPENAI_API_KEY":"…"}. Written to each machine\'s bb daemon environment (0600 file) on create and resume, and re-applied to running machines when changed, which restarts their bb daemon. Stored as a secret. Per-project values: use bb machine env set --project instead.',
       secret: true,
     },
+    opencodeProviders: {
+      type: "string",
+      label: "OpenCode providers (model lists fetched live)",
+      description:
+        'JSON array of OpenAI-compatible providers: [{"id":"zro","baseURL":"https://zro.moonmath.ai/v1","keyEnv":"ZRO_API_KEY"}]. On each machine the plugin calls <baseURL>/models with the key from that env var (Z.ai key or agentSecrets) and writes OpenCode\'s config from the result; providers without a key are skipped. Refreshed on create, resume and credential changes. Empty: Z.ai coding plan, zro, coralbricks, neuralwatt.',
+      experimental_multiline: true,
+      default: "",
+    },
     zaiBaseUrl: {
       type: "string",
       label: "Z.ai Anthropic-compatible endpoint",
@@ -94,6 +102,7 @@ export default async function plugin(bb: BbPluginApi) {
         ...(zai ? { ANTHROPIC_BASE_URL: s.zaiBaseUrl, ANTHROPIC_AUTH_TOKEN: zai, API_TIMEOUT_MS: "3000000", ZAI_API_KEY: zai } : {}),
         ...parseAgentSecrets(s.agentSecrets ?? ""),
       },
+      opencodeProviders: parseOpencodeProviders(s.opencodeProviders ?? ""),
     };
   }
 
@@ -240,7 +249,7 @@ export default async function plugin(bb: BbPluginApi) {
   };
   // Credential settings changed: re-apply the agent env on every running InstaBox machine.
   settings.onChange((next, prev) => {
-    if (next.agentSecrets === prev.agentSecrets && next.zaiApiKey === prev.zaiApiKey && next.zaiBaseUrl === prev.zaiBaseUrl) return;
+    if (next.agentSecrets === prev.agentSecrets && next.zaiApiKey === prev.zaiApiKey && next.zaiBaseUrl === prev.zaiBaseUrl && next.opencodeProviders === prev.opencodeProviders) return;
     void (async () => {
       for (const h of await bb.sdk.hosts.list()) {
         if (h.machineProviderId !== PROVIDER_ID || h.lifecycle.phase !== "active") continue;
