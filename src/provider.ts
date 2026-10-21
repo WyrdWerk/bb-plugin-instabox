@@ -181,6 +181,13 @@ export class InstaboxMachineOps {
     await this.d.intents.delete(key);
   }
 
+  /** Rewrite the agent env on a running machine (after a settings change). Returns the script's last line. */
+  async applyAgentEnv(machineId: string, signal: AbortSignal): Promise<string> {
+    const c = await this.d.config();
+    const executor = new InstaboxExecutor(c.api, machineId);
+    return lastLine(await runScript(executor, agentEnvScript(), signal, { stdin: agentEnvContent(c.agentEnv), what: "agent env" }));
+  }
+
   /** Box side of the tunnel plus the agent credentials. Idempotent. */
   private async prepare(c: ProviderConfig, executor: MachineExecutor, machineId: string, report: Progress, signal: AbortSignal) {
     report.step("Setting up the tunnel endpoint on the machine");

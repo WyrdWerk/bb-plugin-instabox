@@ -10,6 +10,7 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { DEFAULT_API_URL, InstaboxApi, type FetchLike, isRunning } from "./src/instabox-api.ts";
 import { type AllocationIntent, InstaboxMachineOps, inputsSchema, PROVIDER_ID, type ProviderConfig, resourceSchema } from "./src/provider.ts";
 import { TunnelManager } from "./src/tunnel.ts";
+import { parseAgentSecrets } from "./src/box-scripts.ts";
 
 const COMPOSITIONS = [
   {
@@ -55,6 +56,13 @@ export default async function plugin(bb: BbPluginApi) {
         "Given to the bb daemon on each machine as ANTHROPIC_AUTH_TOKEN, with ANTHROPIC_BASE_URL set to the Z.ai endpoint, so the claude-code provider runs on Z.ai's GLM models. Stored as a secret. Empty: the bb server's ZAI_API_KEY environment variable.",
       secret: true,
     },
+    agentSecrets: {
+      type: "string",
+      label: "Extra secrets for agents on every machine",
+      description:
+        'One-line JSON object of NAME → value, e.g. {"GH_TOKEN":"…","OPENAI_API_KEY":"…"}. Written to each machine\'s bb daemon environment (0600 file) on create and resume, and re-applied to running machines when changed, which restarts their bb daemon. Stored as a secret. Per-project values: use bb machine env set --project instead.',
+      secret: true,
+    },
     zaiBaseUrl: {
       type: "string",
       label: "Z.ai Anthropic-compatible endpoint",
@@ -81,7 +89,11 @@ export default async function plugin(bb: BbPluginApi) {
       api: new InstaboxApi(apiKey, fetch as unknown as FetchLike, process.env.INSTABOX_API_URL || DEFAULT_API_URL),
       template: s.template || "agent-browser",
       snapshotId: s.snapshotId || null,
-      agentEnv: zai ? { ANTHROPIC_BASE_URL: s.zaiBaseUrl, ANTHROPIC_AUTH_TOKEN: zai, API_TIMEOUT_MS: "3000000" } : {},
+      // ZAI_API_KEY too, so pi and OpenCode can use their built-in Z.ai providers. User secrets win.
+      agentEnv: {
+        ...(zai ? { ANTHROPIC_BASE_URL: s.zaiBaseUrl, ANTHROPIC_AUTH_TOKEN: zai, API_TIMEOUT_MS: "3000000", ZAI_API_KEY: zai } : {}),
+        ...parseAgentSecrets(s.agentSecrets ?? ""),
+      },
     };
   }
 
@@ -226,6 +238,22 @@ export default async function plugin(bb: BbPluginApi) {
       busy = false;
     }
   };
+  // Credential settings changed: re-apply the agent env on every running InstaBox machine.
+  settings.onChange((next, prev) => {
+    if (next.agentSecrets === prev.agentSecrets && next.zaiApiKey === prev.zaiApiKey && next.zaiBaseUrl === prev.zaiBaseUrl) return;
+    void (async () => {
+      for (const h of await bb.sdk.hosts.list()) {
+        if (h.machineProviderId !== PROVIDER_ID || h.lifecycle.phase !== "active") continue;
+        const parsed = resourceSchema.safeParse(await bb.experimental_machines.getResource(h.id));
+        if (!parsed.success) continue;
+        await ops
+          .applyAgentEnv(parsed.data.machineId, AbortSignal.timeout(120_000))
+          .then((line) => bb.log.info(`${h.id}: ${line}`))
+          .catch((err) => bb.log.warn(`agent env ${h.id}: ${message(err)}`));
+      }
+    })();
+  });
+
   const timer = setInterval(() => void supervise(), SUPERVISE_MS);
   setTimeout(() => void supervise(), 2000);
   bb.onDispose(() => {

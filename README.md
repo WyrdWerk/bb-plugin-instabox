@@ -38,7 +38,8 @@ bb machine create --provider instabox --key <stable-key>
 | `apiKey` (secret) | the server's `INSTABOX_API_KEY` | `ibk_…` |
 | `template` | `agent-browser` | The free plan allows only this template |
 | `snapshotId` | empty | Create machines from a snapshot instead |
-| `zaiApiKey` (secret) | the server's `ZAI_API_KEY` | Given to the daemon as `ANTHROPIC_AUTH_TOKEN`, so claude-code runs on Z.ai |
+| `zaiApiKey` (secret) | the server's `ZAI_API_KEY` | Given to the daemon as `ANTHROPIC_AUTH_TOKEN` (claude-code on Z.ai) and as `ZAI_API_KEY` (pi: pick `zai/<model>`, e.g. `zai/glm-5.2`; bb's model list does not show these) |
+| `agentSecrets` (secret) | empty | One-line JSON `{"NAME":"value",…}` added to every machine's bb daemon environment. Re-applied to running machines when it changes (their daemon restarts). For per-project values use `bb machine env set NAME --project <id>` |
 | `zaiBaseUrl` | `https://api.z.ai/api/anthropic` | |
 | `boxHubPort` | `38886` | Must match `machineServerUrl`; reload the plugin after changing it |
 
@@ -53,6 +54,29 @@ bb thread spawn --project <proj> --environment-provider instabox \
 
 Snapshots of an enrolled box work: create wipes the copied bb identity, so the new
 box enrolls as a new host.
+
+## A basic runner snapshot
+
+Machines are faster to set up from a snapshot that already has the agents. Build one
+from a plain machine that was never enrolled (no bb identity, repos, logins or secrets):
+
+```bash
+sudo npm --prefix /usr/local install -g @earendil-works/pi-coding-agent@latest
+curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path
+sudo ln -sf ~/.opencode/bin/opencode /usr/local/bin/opencode   # claude and codex ship with agent-browser
+```
+
+Save it (`POST /v1/machines/{id}/snapshots`), delete the machine, and set `snapshotId`.
+bb then offers claude-code, codex, pi and OpenCode (`acp-opencode`) on every new machine.
+Model credentials other than Z.ai are not set up: OpenCode's free models are rate
+limited, and codex needs its own login or key (`agentSecrets`).
+
+## Repos and secrets
+
+bb itself clones each project's git remote on the machine (`bb project source add <proj>
+--clone --machine <host>`, or automatically for `--environment-provider instabox`), so
+machines get GitHub's current code, not the hub's copy. Private repos use the hub's `gh`
+login, which bb passes to remote machines, or a `GH_TOKEN` machine variable.
 
 ## Lifecycle
 
@@ -91,7 +115,9 @@ independently.
 | `bb machine suspend` → `resume`, same host, more work after resume | Passed (two runs) |
 | Snapshot of an enrolled box → `bb thread spawn --environment-provider instabox` with `snapshotId` → git remote cloned → thread | Passed; the copied identity was wiped, so the new box enrolled as a new host |
 | Pause from outside bb (stands in for the idle pause) → supervisor marks the host suspended → `bb thread tell` resumes it | Passed after a fix: the first run hung on a stale model-API socket; resume now closes outbound HTTP(S) connections |
-| `bb machine remove` → VM gone (API 404), tunnel processes and credentials removed | Passed (two runs) |
+| `bb machine remove` → VM gone (API 404), tunnel processes and credentials removed | Passed (three runs) |
+| Basic snapshot (pi, OpenCode, claude-code, codex) → new machine → private repo cloned at GitHub HEAD → claude-code and pi (`zai/glm-5.2`) threads | Passed; OpenCode starts but its free model was rate limited |
+| `agentSecrets` changed → re-applied to running machines → visible to the agent | Passed (hash of the value matched) |
 
 ## Known limits
 

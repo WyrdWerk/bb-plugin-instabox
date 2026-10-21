@@ -136,6 +136,26 @@ export function hubHealthScript(boxHubPort: number): string {
   return `curl -fsS -m 5 -o /dev/null http://127.0.0.1:${boxHubPort}/health`;
 }
 
+/**
+ * The `agentSecrets` setting: a one-line JSON object of NAME → string value
+ * (bb secret settings cannot be multi-line). Empty means none. Throws on
+ * anything else; names and values are checked again by agentEnvContent.
+ */
+export function parseAgentSecrets(raw: string): Record<string, string> {
+  if (!raw.trim()) return {};
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    throw new Error('agentSecrets must be a JSON object, e.g. {"GH_TOKEN":"…"}');
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("agentSecrets must be a JSON object");
+  for (const [k, x] of Object.entries(v)) if (typeof x !== "string") throw new Error(`agentSecrets.${k} must be a string`);
+  const out = v as Record<string, string>;
+  agentEnvContent(out);
+  return out;
+}
+
 /** KEY=value lines for the agent env file. Values must be single-line. */
 export function agentEnvContent(vars: Record<string, string>): string {
   return Object.entries(vars)

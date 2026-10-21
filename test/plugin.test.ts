@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
-import { agentEnvContent } from "../src/box-scripts.ts";
+import { agentEnvContent, parseAgentSecrets } from "../src/box-scripts.ts";
 import { shellQuote } from "../src/executor.ts";
 import type { InstaboxApi, Machine, Operation } from "../src/instabox-api.ts";
 import { InstaboxMachineOps, metadataFor } from "../src/provider.ts";
@@ -17,6 +17,16 @@ test("agentEnvContent refuses values that would inject extra lines", () => {
   assert.equal(agentEnvContent({ A: "x.y", B: "z" }), "A=x.y\nB=z\n");
   assert.throws(() => agentEnvContent({ A: "x\nEVIL=1" }));
   assert.throws(() => agentEnvContent({ "A B": "x" }));
+});
+
+test("parseAgentSecrets accepts a JSON object of strings and rejects anything that could smuggle lines", () => {
+  assert.deepEqual(parseAgentSecrets(""), {});
+  assert.deepEqual(parseAgentSecrets('{"GH_TOKEN":"ghp_x","B":"a=b c"}'), { GH_TOKEN: "ghp_x", B: "a=b c" });
+  assert.throws(() => parseAgentSecrets("GH_TOKEN=x"));
+  assert.throws(() => parseAgentSecrets('["x"]'));
+  assert.throws(() => parseAgentSecrets('{"N":1}'));
+  assert.throws(() => parseAgentSecrets('{"A":"x\\nEVIL=1"}'));
+  assert.throws(() => parseAgentSecrets('{"A;rm":"x"}'));
 });
 
 /** Fake InstaBox: records calls; machines appear when their create op is read. */
