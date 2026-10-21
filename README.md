@@ -97,7 +97,7 @@ Per-project secrets: `printf %s "$VALUE" | bb machine env set NAME --project <pr
 | `apiKey` (secret) | the server's `INSTABOX_API_KEY` | `ibk_…` |
 | `template` | `agent-browser` | The free plan allows only this template |
 | `snapshotId` | empty | Create machines from a snapshot instead |
-| `zaiApiKey` (secret) | the server's `ZAI_API_KEY` | Given to the daemon as `ANTHROPIC_AUTH_TOKEN` (claude-code on Z.ai) and as `ZAI_API_KEY` (pi: pick `zai/<model>`, e.g. `zai/glm-5.2`; bb's model list does not show these) |
+| `zaiApiKey` (secret) | the server's `ZAI_API_KEY` | Given to the daemon as `ANTHROPIC_AUTH_TOKEN` (claude-code on Z.ai) and as `ZAI_API_KEY`. pi: pick `zai/<model>`, e.g. `zai/glm-5.2` (bb's model list does not show these). OpenCode: the plugin writes `~/.config/opencode/opencode.json` with a `zai-coding-plan` provider (`api.z.ai/api/coding/paas/v4`, key read from `$ZAI_API_KEY`, no secret in the file), so `acp-opencode` lists `zai-coding-plan/glm-5.3` etc. A user-owned opencode.json is left alone |
 | `agentSecrets` (secret) | empty | One-line JSON `{"NAME":"value",…}` added to every machine's bb daemon environment. Re-applied to running machines when it changes (their daemon restarts). For per-project values use `bb machine env set NAME --project <id>` |
 | `zaiBaseUrl` | `https://api.z.ai/api/anthropic` | |
 | `boxHubPort` | `38886` | Must match `machineServerUrl`; reload the plugin after changing it |
@@ -142,8 +142,8 @@ Do not sign anything in on the build machine: everything in `/data` (home includ
 saved into the snapshot. A machine from this snapshot takes about 2.5 min to connect
 (about 30 s from the template).
 bb then offers claude-code, codex, pi and OpenCode (`acp-opencode`) on every new machine.
-Model credentials other than Z.ai are not set up: OpenCode's free models are rate
-limited, and codex needs its own login or key (`agentSecrets`).
+With `zaiApiKey` set, claude-code, pi and OpenCode run on Z.ai out of the box. codex and
+subscription logins (Claude, ChatGPT) are not set up yet.
 
 ## Repos and secrets
 
@@ -190,7 +190,8 @@ independently.
 | Snapshot of an enrolled box → `bb thread spawn --environment-provider instabox` with `snapshotId` → git remote cloned → thread | Passed; the copied identity was wiped, so the new box enrolled as a new host |
 | Pause from outside bb (stands in for the idle pause) → supervisor marks the host suspended → `bb thread tell` resumes it | Passed after a fix: the first run hung on a stale model-API socket; resume now closes outbound HTTP(S) connections |
 | `bb machine remove` → VM gone (API 404), tunnel processes and credentials removed | Passed (three runs) |
-| Basic snapshot (pi, OpenCode, claude-code, codex) → new machine → private repo cloned at GitHub HEAD → claude-code and pi (`zai/glm-5.2`) threads | Passed; OpenCode starts but its free model was rate limited |
+| Basic snapshot (pi, OpenCode, claude-code, codex) → new machine → private repo cloned at GitHub HEAD → claude-code (`claude-sonnet-5-5` via Z.ai), pi (`zai/glm-5.2`) and OpenCode (`zai-coding-plan/glm-5.3`) threads, then suspend/resume and a follow-up turn on pi and OpenCode | Passed (all answers matched values computed independently) |
+| `bb thread spawn --environment-provider instabox --provider acp-opencode --model zai-coding-plan/glm-5.3` → new box from the snapshot → private repo cloned → answer → `bb machine remove` | Passed (about 40 s to provision) |
 | `agentSecrets` changed → re-applied to running machines → visible to the agent | Passed (hash of the value matched) |
 
 ## Known limits
@@ -203,5 +204,10 @@ independently.
   Certificate renewal at 23 h and cleanup after an interrupted create are not tested live.
 - A snapshot of an enrolled box contains its `~/.config/bb-instabox/agent.env`
   (the Z.ai key). Snapshots are private to the account; create overwrites the file.
+- In one of two one-step runs (`--environment-provider instabox`), OpenCode with GLM-5.3
+  answered bb's injected tool notice instead of the prompt; the rerun answered correctly.
+- One create out of six failed inside bb's own enrollment (`Could not exchange machine
+  enrollment credential`) after the plugin's setup had succeeded; bb rolled it back cleanly
+  (VM deleted) and the next create worked. Cause not found; retry the create.
 - The hub's memory use matters: on a 3 GiB orb, bb was OOM-killed once during
   bootstrap, and the create still completed after the restart.

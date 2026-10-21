@@ -131,6 +131,43 @@ echo "stale-conns closed=$((before - after)) left=$after"
 `;
 }
 
+/** OpenCode has no built-in env-key pickup for Z.ai; this config adds the coding-plan endpoint, key from $ZAI_API_KEY. */
+export const OPENCODE_ZAI_MODELS = ["glm-5.3", "glm-5.2", "glm-5-turbo", "glm-4.7"] as const;
+const OPENCODE_MARK = "Z.AI Coding Plan (bb-plugin-instabox)";
+export function opencodeConfig(): string {
+  return JSON.stringify(
+    {
+      $schema: "https://opencode.ai/config.json",
+      provider: {
+        "zai-coding-plan": {
+          npm: "@ai-sdk/openai-compatible",
+          name: OPENCODE_MARK,
+          options: { baseURL: "https://api.z.ai/api/coding/paas/v4", apiKey: "{env:ZAI_API_KEY}" },
+          models: Object.fromEntries(OPENCODE_ZAI_MODELS.map((m) => [m, { name: m }])),
+        },
+      },
+    },
+    null,
+    2,
+  );
+}
+
+/**
+ * Write ~/.config/opencode/opencode.json (no secrets: the key is read from the
+ * daemon env) unless the user already has their own file there. Last line:
+ * `opencode-config=written|unchanged|kept-user-file`.
+ */
+export function opencodeConfigScript(): string {
+  return `set -euo pipefail
+f="$HOME/.config/opencode/opencode.json"
+mkdir -p "$(dirname "$f")"
+new=$(mktemp "$f.XXXXXX")
+cat > "$new"
+if [ -s "$f" ] && ! grep -qF '${OPENCODE_MARK}' "$f"; then rm -f "$new"; echo "opencode-config=kept-user-file"; exit 0; fi
+if cmp -s "$new" "$f"; then rm -f "$new"; echo "opencode-config=unchanged"; else mv -f "$new" "$f"; chmod 644 "$f"; echo "opencode-config=written"; fi
+`;
+}
+
 /** Exit 0 when the hub answers /health on the box's loopback end of the tunnel. */
 export function hubHealthScript(boxHubPort: number): string {
   return `curl -fsS -m 5 -o /dev/null http://127.0.0.1:${boxHubPort}/health`;

@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { MachineBootstrapApi, MachineExecutor } from "@get-bb/plugin-sdk";
-import { agentEnvContent, agentEnvScript, hubHealthScript, identityResetScript, staleConnectionsScript, tunnelSetupScript } from "./box-scripts.ts";
+import { agentEnvContent, agentEnvScript, hubHealthScript, identityResetScript, opencodeConfig, opencodeConfigScript, staleConnectionsScript, tunnelSetupScript } from "./box-scripts.ts";
 import { InstaboxExecutor, runScript } from "./executor.ts";
 import { type InstaboxApi, isNotFound, isRunning, type Machine, type Operation, STOPPED_STATES, SUSPENDED_STATES } from "./instabox-api.ts";
 import type { TunnelManager } from "./tunnel.ts";
@@ -196,6 +196,7 @@ export class InstaboxMachineOps {
     const names = Object.keys(c.agentEnv);
     report.step(`Giving the bb daemon its agent credentials (${names.length ? names.join(", ") : "none configured"})`);
     report.log(lastLine(await runScript(executor, agentEnvScript(), signal, { stdin: agentEnvContent(c.agentEnv), what: "agent env" })));
+    if (c.agentEnv.ZAI_API_KEY) report.log(lastLine(await runScript(executor, opencodeConfigScript(), signal, { stdin: opencodeConfig(), what: "opencode config" })));
   }
 
   /** Open the hub-side tunnel and require the hub's /health from inside the box. */
