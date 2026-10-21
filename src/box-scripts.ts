@@ -197,12 +197,20 @@ try {
     if (i > 0) env[line.slice(0, i)] = line.slice(i + 1);
   }
 } catch {}
-let prev = null;
-try { prev = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
-const ours = (c) => !c || Object.values((c && c.provider) || {}).some((p) => String(p && p.name).endsWith(MARK));
+// Ownership: the sha256 of exactly what this plugin last wrote, kept beside the agent env.
+// The config is ours only if it is missing, matches that hash, or (older plugin) carries MARK.
+const crypto = require("node:crypto");
+const ownFile = path.join(process.env.HOME, ".config/bb-instabox/opencode.owned");
+const sha = (t) => crypto.createHash("sha256").update(t).digest("hex");
+let raw = null, prev = null, owned = null;
+try { raw = fs.readFileSync(file, "utf8"); } catch {}
+try { prev = JSON.parse(raw); } catch {}
+try { owned = fs.readFileSync(ownFile, "utf8").trim(); } catch {}
+const ours = raw === null || (owned !== null && owned === sha(raw)) ||
+  (owned === null && prev !== null && Object.values(prev.provider || {}).some((p) => String(p && p.name).endsWith(MARK)));
 const report = [];
 (async () => {
-  if (prev && !ours(prev)) { console.log("opencode-config=kept-user-file"); return; }
+  if (!ours) { console.log("opencode-config=kept-user-file"); return; }
   const out = { $schema: "https://opencode.ai/config.json", provider: {} };
   for (const p of providers) {
     const key = env[p.keyEnv];
@@ -228,15 +236,17 @@ const report = [];
     };
   }
   const text = JSON.stringify(out, null, 2) + "\n";
-  let old = null;
-  try { old = fs.readFileSync(file, "utf8"); } catch {}
   let state = "unchanged";
-  if (old !== text) {
+  if (raw !== text) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = file + ".tmp" + process.pid;
     fs.writeFileSync(tmp, text, { mode: 0o644 });
     fs.renameSync(tmp, file);
     state = "written";
+  }
+  if (owned !== sha(text)) {
+    fs.mkdirSync(path.dirname(ownFile), { recursive: true });
+    fs.writeFileSync(ownFile, sha(text) + "\n", { mode: 0o600 });
   }
   console.log("opencode-config=" + state + " " + report.join(" "));
 })().catch((e) => { console.log("opencode-config=failed " + e.message); process.exit(1); });

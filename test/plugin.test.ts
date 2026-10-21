@@ -140,10 +140,29 @@ test("OpenCode sync builds providers from live /models, keeps keys out of the fi
   assert.match(await run(), /zai:2-kept\(http 500\)/);
   assert.deepEqual(Object.keys(JSON.parse(readFileSync(file, "utf8")).provider.zai.models), ["glm-a", "glm-b"]);
 
-  const mine = '{"provider":{"x":{"name":"mine"}}}';
-  writeFileSync(file, mine);
-  assert.equal(await run(), "opencode-config=kept-user-file restarted=0");
-  assert.equal(readFileSync(file, "utf8"), mine);
+  // A user's own files are never touched: a normal config, one without providers, and JSONC.
+  for (const mine of ['{"provider":{"x":{"name":"mine"}}}', '{"theme":"dark"}', '// mine\n{"theme":"dark"}']) {
+    writeFileSync(file, mine);
+    assert.equal(await run(), "opencode-config=kept-user-file restarted=0");
+    assert.equal(readFileSync(file, "utf8"), mine);
+  }
+});
+
+test("OpenCode sync still owns its file after writing one with no providers", async () => {
+  const home = mkdtempSync(join(tmpdir(), "ib-oc-"));
+  const file = join(home, ".config/opencode/opencode.json");
+  const run = (providers: string) =>
+    new Promise<string>((resolve, reject) => {
+      const c = execFile("bash", ["-c", opencodeSyncScript()], { cwd: home, env: { HOME: home, PATH: process.env.PATH } }, (e, out) => (e ? reject(e) : resolve(out.trim().split("\n").pop() ?? "")));
+      c.stdin!.end(providers);
+    });
+  // No key anywhere: the plugin writes a config with no providers.
+  assert.match(await run('[{"id":"zai","baseURL":"https://127.0.0.1:1/v1","keyEnv":"ZAI_API_KEY"}]'), /^opencode-config=written zai:skip-no-key/);
+  // Next sync with nothing to fetch must not call it a user file.
+  assert.match(await run("[]"), /^opencode-config=unchanged/);
+  // Once the user edits it, it is theirs.
+  writeFileSync(file, '{"theme":"dark"}');
+  assert.match(await run("[]"), /^opencode-config=kept-user-file/);
 });
 
 test("parseOpencodeProviders defaults when empty and rejects unsafe entries", () => {
