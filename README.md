@@ -26,12 +26,71 @@ chisel password, stored in plugin KV and delivered to the box over stdin.
 
 ## Setup
 
+### 1. The hub
+
+An always-on machine running bb ≥ 0.45 (the "hub"). It needs:
+
+- `node`/`npm`, `ssh` and `ssh-keygen` on the bb server's PATH (chisel is downloaded by the plugin);
+- about 4 GiB of free memory or more (a 3 GiB machine OOM-killed bb once during a create);
+- `gh auth login` on the hub if runners should clone **private** repos: bb passes the hub's
+  `gh` login to remote machines (`bb machine env list` shows `builtInGit: logged in`).
+  A `GH_TOKEN` machine variable (`bb machine env set GH_TOKEN`) overrides it.
+
+No Tailscale, no bb Connect and no public port are needed.
+
+### 2. Install the plugin
+
 ```bash
-bb plugin install /path/to/bb-plugin-instabox --yes
+git clone https://github.com/WyrdWerk/bb-plugin-instabox && cd bb-plugin-instabox
+npm ci
+bb plugin build .
+bb plugin install "$PWD" --yes
+```
+
+(Installing straight from the Git URL has not been tested.)
+
+### 3. Credentials and hub settings
+
+Either export `INSTABOX_API_KEY` (and `ZAI_API_KEY`) in the bb server's environment,
+or store them as plugin secrets:
+
+```bash
+bb plugin config instabox set apiKey 'ibk_…'
+bb plugin config instabox set zaiApiKey '…'                      # optional: claude-code and pi on Z.ai
+bb plugin config instabox set agentSecrets '{"OPENAI_API_KEY":"…"}'  # optional: any other agent env
+```
+
+(`bb plugin config … set` takes the value as an argument; the bb Settings page can
+edit the same secret fields.) Then point machines at the tunnel; the plugin shows
+"setup required" with this exact command until it is done:
+
+```bash
 bb settings general defaultMachineAccess direct
 bb settings general machineServerUrl http://127.0.0.1:38886
-bb machine create --provider instabox --key <stable-key>
 ```
+
+### 4. A basic runner snapshot (recommended)
+
+See [A basic runner snapshot](#a-basic-runner-snapshot), then
+`bb plugin config instabox set snapshotId sn_…`. Without it, machines start from the
+`agent-browser` template (claude-code and codex only).
+
+### 5. Use it
+
+```bash
+# a runner on its own
+bb machine create --provider instabox --key <stable-key>
+# a project's repo on that runner (bb clones the GitHub remote, not the hub's copy)
+bb project source add <projectId> --clone --machine <hostId>
+bb thread spawn --project <projectId> --machine <hostId> --new-environment worktree --provider claude-code --prompt '…'
+# or: a new machine per thread, created, cloned and started in one step
+bb thread spawn --project <projectId> --environment-provider instabox --provider pi --model zai/glm-5.2 --prompt '…'
+# done with a runner
+bb machine remove <hostId> --yes
+```
+
+Per-project secrets: `printf %s "$VALUE" | bb machine env set NAME --project <projectId>`
+(encrypted by bb, passed to that project's machines on each turn).
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -52,8 +111,9 @@ bb thread spawn --project <proj> --environment-provider instabox \
   --machine-inputs '{"snapshotId":"sn_…"}' --provider claude-code --prompt '…'
 ```
 
-Snapshots of an enrolled box work: create wipes the copied bb identity, so the new
-box enrolls as a new host.
+Snapshots of an enrolled box also work (create wipes the copied bb identity, so the
+new box enrolls as a new host), but they carry that box's agent env file; prefer a
+clean snapshot as below.
 
 ## A basic runner snapshot
 
@@ -61,12 +121,26 @@ Machines are faster to set up from a snapshot that already has the agents. Build
 from a plain machine that was never enrolled (no bb identity, repos, logins or secrets):
 
 ```bash
-sudo npm --prefix /usr/local install -g @earendil-works/pi-coding-agent@latest
+H="X-API-Key: $INSTABOX_API_KEY"; API=https://api.instabox.sh/v1
+# 1. a plain machine, outside bb
+curl -s -X POST $API/machines -H "$H" -H "Idempotency-Key: $(uuidgen)" -H 'Content-Type: application/json' \
+  -d '{"name":"runner-base-build","templateId":"agent-browser"}' | jq -r .machineId     # → m_…
+# 2. install pi and OpenCode on it (claude and codex ship with agent-browser)
+cat > install.sh <<'SH'
+sudo -n env HOME=/root npm --prefix /usr/local install -g @earendil-works/pi-coding-agent@latest
 curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path
-sudo ln -sf ~/.opencode/bin/opencode /usr/local/bin/opencode   # claude and codex ship with agent-browser
+sudo -n ln -sf "$HOME/.opencode/bin/opencode" /usr/local/bin/opencode
+for b in pi opencode claude codex; do $b --version | head -1; done
+SH
+jq -n --rawfile c install.sh '{cmd:$c,timeoutSeconds:300}' | curl -s -X POST $API/machines/m_…/exec -H "$H" -H 'Content-Type: application/json' -d @- | jq -r .stdout
+# 3. save, then delete the build machine
+curl -s -X POST $API/machines/m_…/snapshots -H "$H" -H "Idempotency-Key: $(uuidgen)" -H 'Content-Type: application/json' -d '{"name":"bb-runner-basic-v1"}' | jq -r .id
+curl -s -X DELETE $API/machines/m_… -H "$H" -H "Idempotency-Key: $(uuidgen)"
 ```
 
-Save it (`POST /v1/machines/{id}/snapshots`), delete the machine, and set `snapshotId`.
+Do not sign anything in on the build machine: everything in `/data` (home included) is
+saved into the snapshot. A machine from this snapshot takes about 2.5 min to connect
+(about 30 s from the template).
 bb then offers claude-code, codex, pi and OpenCode (`acp-opencode`) on every new machine.
 Model credentials other than Z.ai are not set up: OpenCode's free models are rate
 limited, and codex needs its own login or key (`agentSecrets`).
