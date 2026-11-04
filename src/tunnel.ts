@@ -36,6 +36,8 @@ export interface TunnelOptions {
 interface Tunnel {
   ssh: ChildProcess | null;
   chisel: ChildProcess | null;
+  /** Last stderr of the ssh process, for errors. */
+  sshTail: () => string;
   certExpiresAt: number;
   localPort: number;
   stopping: boolean;
@@ -88,9 +90,9 @@ export class TunnelManager {
     writePrivate(`${base}-cert.pub`, `${conn.certificate.trim()}\n`);
     writePrivate(`${base}.known_hosts`, `@cert-authority [${conn.host}]:${conn.port} ${conn.hostTrust.publicKey.trim()}\n`);
     const localPort = prev?.localPort ?? (await freePort());
-    const t: Tunnel = { ssh: null, chisel: null, certExpiresAt: Date.parse(conn.expiresAt) || Date.now() + CERT_TTL_SECONDS * 1000, localPort, stopping: false };
+    const t: Tunnel = { ssh: null, chisel: null, sshTail: () => "", certExpiresAt: Date.parse(conn.expiresAt) || Date.now() + CERT_TTL_SECONDS * 1000, localPort, stopping: false };
     this.tunnels.set(machineId, t);
-    t.ssh = this.spawn(machineId, "ssh", "ssh", [
+    const ssh = this.spawn(machineId, "ssh", "ssh", [
       "-N",
       "-p", String(conn.port),
       "-i", key.path,
@@ -106,7 +108,14 @@ export class TunnelManager {
       "-L", `127.0.0.1:${localPort}:127.0.0.1:${BOX_CHISEL_PORT}`,
       `${conn.username}@${conn.host}`,
     ], {});
-    await waitForPort(localPort, 20_000);
+    t.ssh = ssh.child;
+    t.sshTail = ssh.tail;
+    try {
+      await waitForPort(localPort, 20_000, () => !alive(t.ssh));
+    } catch (err) {
+      const why = redact(t.sshTail().trim().split("\n").slice(-2).join(" | "));
+      throw new Error(`${(err as Error).message}${why ? ` (ssh: ${why})` : ""}`);
+    }
     // AUTH via the environment, not argv (argv is visible in ps).
     t.chisel = this.spawn(machineId, "chisel", chisel, [
       "client",
@@ -114,7 +123,7 @@ export class TunnelManager {
       "--max-retry-interval", "10s",
       `http://127.0.0.1:${localPort}`,
       `R:127.0.0.1:${this.o.boxHubPort}:127.0.0.1:${this.o.hubPort()}`,
-    ], { AUTH: await this.o.auth(machineId) });
+    ], { AUTH: await this.o.auth(machineId) }).child;
     this.o.log(`tunnel ${machineId}: ssh -L ${localPort} → box:${BOX_CHISEL_PORT}, reverse box:${this.o.boxHubPort} → hub:${this.o.hubPort()}`);
   }
 
@@ -141,7 +150,7 @@ export class TunnelManager {
     t.ssh?.kill("SIGTERM");
   }
 
-  private spawn(machineId: string, what: string, cmd: string, args: string[], env: Record<string, string>): ChildProcess {
+  private spawn(machineId: string, what: string, cmd: string, args: string[], env: Record<string, string>): { child: ChildProcess; tail: () => string } {
     const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"], env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: process.env.HOME ?? "/tmp", ...env } });
     let tail = "";
     child.stderr?.on("data", (d: Buffer) => {
@@ -151,7 +160,7 @@ export class TunnelManager {
       const t = this.tunnels.get(machineId);
       if (t && !t.stopping) this.o.log(`tunnel ${machineId}: ${what} exited (${sig ?? code}); last output: ${redact(tail.trim().split("\n").slice(-2).join(" | "))}`);
     });
-    return child;
+    return { child, tail: () => tail };
   }
 
   /** One Ed25519 key for this hub (ssh-keygen); certificates are per machine. */
@@ -163,6 +172,8 @@ export class TunnelManager {
       const r = spawnSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "bb-plugin-instabox", "-f", path], { stdio: "ignore" });
       if (r.status !== 0) throw new Error("ssh-keygen failed (is OpenSSH installed on the bb server?)");
     }
+    // ssh refuses a key others can read; an inherited default ACL can leave it 0640.
+    chmodSync(path, 0o600);
     return { path, publicKey: readFileSync(`${path}.pub`, "utf8").trim() };
   }
 
@@ -219,7 +230,7 @@ function freePort(): Promise<number> {
   });
 }
 
-async function waitForPort(port: number, maxMs: number): Promise<void> {
+async function waitForPort(port: number, maxMs: number, gaveUp: () => boolean = () => false): Promise<void> {
   const { connect } = await import("node:net");
   const until = Date.now() + maxMs;
   for (;;) {
@@ -229,6 +240,7 @@ async function waitForPort(port: number, maxMs: number): Promise<void> {
       c.once("error", () => resolve(false));
     });
     if (ok) return;
+    if (gaveUp()) throw new Error("SSH forward to the box failed: ssh exited");
     if (Date.now() > until) throw new Error(`SSH forward to the box did not open within ${Math.round(maxMs / 1000)} s`);
     await new Promise((r) => setTimeout(r, 300));
   }
