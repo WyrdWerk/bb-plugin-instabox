@@ -71,3 +71,18 @@ export function useIdleChoices(): { choices: IdleChoicesDto | null; error: strin
   }, [rpc]);
   return { choices, error };
 }
+
+/** Names of the plugin's projects (with at least one repo), for project pickers. */
+export function useProjectNames(): string[] {
+  const rpc = useRpc<DashboardRpc>();
+  const [names, setNames] = useState<string[]>([]);
+  const refetch = useCallback(() => {
+    rpc.call("projects_list", null).then(
+      (r) => setNames(r.projects.filter((p) => p.repos.length > 0).map((p) => p.name)),
+      () => setNames([]),
+    );
+  }, [rpc]);
+  useEffect(refetch, [refetch]);
+  useRealtime(INSTABOX_CHANGED, refetch);
+  return names;
+}

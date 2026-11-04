@@ -13,7 +13,8 @@ import type { ExecResultDto, MachineDto, OverviewDto, SnapshotDto, TemplateDto }
 import { ActionDialog, type DialogSpec, type DialogValues } from "./dialogs.tsx";
 import { ago, idleText, labelsText, parseLabels, suggestSnapshotName } from "./format.ts";
 import { AccountSection, MachinesSection, RunCommandSection, SnapshotsSection, TemplatesSection, type MachineAction } from "./sections.tsx";
-import { useIdleChoices, useInstaboxOverview, useInstaboxRunning } from "./useInstabox.ts";
+import { ProjectsSection } from "./ProjectsSection.tsx";
+import { useIdleChoices, useInstaboxOverview, useInstaboxRunning, useProjectNames } from "./useInstabox.ts";
 
 function useNow(ms = 15_000) {
   const [now, setNow] = useState(() => Date.now());
@@ -29,6 +30,7 @@ type Notice = { message: string; hostId?: string | null };
 export function InstaboxPage(_props: PluginNavPanelProps) {
   const { rpc, data, error, loading, refetch } = useInstaboxOverview();
   const { choices } = useIdleChoices();
+  const projectNames = useProjectNames();
   const [spec, setSpec] = useState<DialogSpec | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [execResult, setExecResult] = useState<ExecResultDto | null>(null);
@@ -265,6 +267,14 @@ export function InstaboxPage(_props: PluginNavPanelProps) {
         { kind: "text", key: "name", label: "Name", initial: "", placeholder: "lowercase-name", hint: "Required for a plain machine; a bb runner gets bb-<hash>", required: false },
         { kind: "select", key: "idle", label: "Idle pause", initial: idleOpts[0]?.value ?? "", options: idleOpts, hint: "While a bb thread works, the plugin holds an activity lease regardless of this value." },
         { kind: "checkbox", key: "asRunner", label: "Create as a bb runner (enroll it)", initial: false },
+        {
+          kind: "select",
+          key: "project",
+          label: "Project (bb runners only)",
+          initial: "",
+          options: [{ value: "", label: "None" }, ...projectNames.map((n) => ({ value: n, label: n }))],
+          hint: "Clones each repo of the project at its branch into ~/workspace/repos and registers it as a bb project source on the runner.",
+        },
       ],
       run: async (v) => {
         const source = String(v.source);
@@ -273,6 +283,8 @@ export function InstaboxPage(_props: PluginNavPanelProps) {
         if (!asRunner && name === "") throw new Error("A machine name is required");
         if (name !== "" && !/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) throw new Error("Name: lowercase letters, digits and dashes, starting with a letter or digit");
         if (source === "") throw new Error("Choose a template or snapshot");
+        const project = String(v.project ?? "");
+        if (project !== "" && !asRunner) throw new Error("A project needs \"Create as a bb runner\" checked");
         const idleSeconds = String(v.idle ?? "") === "" ? null : Number(v.idle);
         const parsed = source.startsWith("template:")
           ? ({ kind: "template" as const, templateId: source.slice("template:".length).split("@")[0]! })
@@ -282,6 +294,7 @@ export function InstaboxPage(_props: PluginNavPanelProps) {
           source: parsed,
           idleSeconds,
           asRunner,
+          ...(project !== "" ? { project } : {}),
           requestId: crypto.randomUUID(),
         });
         return { message: r.message, hostId: r.hostId };
@@ -378,6 +391,7 @@ export function InstaboxPage(_props: PluginNavPanelProps) {
               onNewFrom={(s) => open(createMachine({ snapshot: s }))}
               onDelete={(s) => open(deleteSnapshot(s))}
             />
+            <ProjectsSection />
             <TemplatesSection data={data} onNew={(t) => open(createMachine({ template: t }))} />
             <RunCommandSection data={data} result={execResult} onRun={(id, cmd, t) => open(runCommand(id, cmd, t))} onClear={() => setExecResult(null)} />
           </>

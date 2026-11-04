@@ -5,6 +5,7 @@
 // gateway plus a chisel reverse tunnel (src/tunnel.ts). bb's direct machine
 // access must point machines at that tunnel: `machineServerUrl
 // http://127.0.0.1:<boxHubPort>` (default 38886). See README.md.
+import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { z } from "zod";
 import type { BbPluginApi, JsonValue } from "@get-bb/plugin-sdk";
@@ -14,6 +15,8 @@ import { TunnelManager } from "./src/tunnel.ts";
 import { parseOpencodeProviders } from "./src/box-scripts.ts";
 import { ActivityLeases, IdleWatch } from "./src/activity.ts";
 import { createDashboardHandlers, dashboardRpc, INSTABOX_CHANGED } from "./src/dashboard.ts";
+import { createRepoLister, type GhRun, resolveOwners } from "./src/github-repos.ts";
+import { ProjectStore } from "./src/project-store.ts";
 
 const COMPOSITIONS = [
   {
@@ -68,6 +71,18 @@ export default async function plugin(bb: BbPluginApi) {
       experimental_multiline: true,
       default: "",
     },
+    githubOwners: {
+      type: "string",
+      label: "GitHub owners for the repo picker",
+      description: "Comma list of GitHub users/orgs whose repos the Projects editor offers (`gh repo list` on this bb server). Empty: WyrdWerk plus the account gh is logged in as.",
+      default: "",
+    },
+    createMissingProjects: {
+      type: "boolean",
+      label: "Create bb projects for unmatched repos",
+      description: "When a repo cloned for a project runner matches no bb project by git remote, create a bb project from the clone on the runner. Off: the clone is left unregistered (logged).",
+      default: false,
+    },
     boxHubPort: {
       type: "number",
       label: "Hub port on the machine's loopback",
@@ -92,6 +107,7 @@ export default async function plugin(bb: BbPluginApi) {
       // 0 = send nothing: InstaBox's account default. It does not mean "off".
       autoSuspendAfterSeconds: idle > 0 ? idle : null,
       opencodeProviders: parseOpencodeProviders(s.opencodeProviders ?? ""),
+      createMissingProjects: s.createMissingProjects === true,
     };
   }
 
@@ -140,6 +156,27 @@ export default async function plugin(bb: BbPluginApi) {
     auth: tunnelAuth.get,
   });
 
+  // Project runners: plugin-owned projects and the gh-backed repo/branch picker.
+  const projectStore = new ProjectStore(bb.storage.kv);
+  const runGh: GhRun = (args) =>
+    new Promise((resolve, reject) => {
+      execFile("gh", args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err && (err as NodeJS.ErrnoException).code === "ENOENT") return reject(err);
+        const code = err ? (typeof (err as { code?: unknown }).code === "number" ? (err as { code: number }).code : 1) : 0;
+        resolve({ code, stdout: String(stdout), stderr: String(stderr) });
+      });
+    });
+  const github = createRepoLister({
+    runGh,
+    now: () => Date.now(),
+    owners: async () =>
+      resolveOwners((await settings.get()).githubOwners ?? "", async () => {
+        const r = await runGh(["api", "user", "--jq", ".login"]);
+        return r.code === 0 ? r.stdout.trim() || null : null;
+      }),
+  });
+  type BbProject = { id: string; name: string; gitRemoteUrl: string | null; sources?: { hostId: string; path: string }[] };
+
   const intentKey = (key: string) => `alloc/${key}`;
   const ops = new InstaboxMachineOps({
     config,
@@ -152,6 +189,18 @@ export default async function plugin(bb: BbPluginApi) {
       delete: (key) => bb.storage.kv.delete(intentKey(key)),
     },
     tunnelAuth,
+    projects: {
+      getProject: (name) => projectStore.get(name),
+      listProjects: async () =>
+        ((await bb.sdk.projects.list()) as unknown as BbProject[]).map((p) => ({
+          id: p.id,
+          name: p.name,
+          gitRemoteUrl: p.gitRemoteUrl,
+          sources: (p.sources ?? []).map((x) => ({ hostId: x.hostId, path: x.path })),
+        })),
+      addProjectSource: async ({ projectId, hostId, path }) => void (await bb.sdk.projects.sources.add({ projectId, type: "local_path", hostId, path })),
+      createProject: async ({ name, hostId, path }) => ({ id: ((await bb.sdk.projects.create({ name, source: { type: "local_path", hostId, path } })) as unknown as { id: string }).id }),
+    },
     log: (m) => bb.log.info(m),
     sleep: (ms, signal) =>
       new Promise((resolve, reject) => {
@@ -336,6 +385,8 @@ export default async function plugin(bb: BbPluginApi) {
       publish: () => bb.realtime.publish(INSTABOX_CHANGED, {}),
       now: () => Date.now(),
       hubWarning,
+      projectStore,
+      github,
     }),
   );
 

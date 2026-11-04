@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { OPENCODE_TEMPLATE_HASHES, opencodeSyncScript, parseOpencodeProviders, secretsEnvScript } from "../src/box-scripts.ts";
 import { shellQuote } from "../src/executor.ts";
 import type { InstaboxApi, Machine, Operation } from "../src/instabox-api.ts";
-import { InstaboxMachineOps, metadataFor } from "../src/provider.ts";
+import { InstaboxMachineOps, metadataFor, type ProjectsDeps } from "../src/provider.ts";
 import type { TunnelManager } from "../src/tunnel.ts";
 
 test("shellQuote: bash sees exactly the original argv", () => {
@@ -77,8 +77,9 @@ function fakeApi() {
   return { api: api as unknown as InstaboxApi, machines, calls, createBodies };
 }
 
-function opsWith(api: InstaboxApi, intents = new Map<string, unknown>()) {
+function opsWith(api: InstaboxApi, intents = new Map<string, unknown>(), projects?: ProjectsDeps) {
   return new InstaboxMachineOps({
+    ...(projects ? { projects } : {}),
     config: async () => ({ api, template: "agent-browser", snapshotId: null, autoSuspendAfterSeconds: 300, opencodeProviders: [] }),
     tunnels: { ensure: async () => {}, stop: () => {} } as unknown as TunnelManager,
     boxHubPort: 38886,
@@ -111,6 +112,41 @@ test("a retried create reuses the recorded machine instead of allocating another
   assert.equal(createBodies[0].secrets, "all");
   assert.equal(createBodies[0].autoSuspendAfterSeconds, 300);
   assert.equal(calls.filter((c) => c === "secrets-get").length, 2);
+});
+
+test("a project runner: an unknown or empty project fails before allocating; clones run per repo with the branch and register sources", async () => {
+  const { api, calls } = fakeApi();
+  const added: string[] = [];
+  const projects: ProjectsDeps = {
+    getProject: async (n) => (n === "demo" ? { name: "demo", repos: [{ name: "app", url: "https://github.com/acme/app.git", branch: "dev" }, { name: "lib", url: "https://github.com/acme/lib.git" }] } : n === "empty" ? { name: "empty", repos: [] } : null),
+    listProjects: async () => [{ id: "p_app", name: "app", gitRemoteUrl: "https://github.com/acme/app", sources: [] }],
+    addProjectSource: async (a) => void added.push(`${a.projectId} ${a.hostId} ${a.path}`),
+    createProject: async () => {
+      throw new Error("createMissingProjects is off");
+    },
+  };
+  const ops = opsWith(api, new Map(), projects);
+  await assert.rejects(ops.create("k1", { project: "nope" }, async () => {}, progress, new AbortController().signal), /Unknown project "nope"/);
+  await assert.rejects(ops.create("k2", { project: "empty" }, async () => {}, progress, new AbortController().signal), /no repos/);
+  assert.equal(calls.filter((c) => c.startsWith("create")).length, 0);
+  assert.equal(await opsWith(api).create("k3", { project: "demo" }, async () => {}, progress, new AbortController().signal).catch((e: Error) => e.message), "Project runners are not available in this plugin build");
+
+  const stdins: string[] = [];
+  const executor = {
+    exec: async (a: { stdin?: string; onOutput?: (t: string) => void }) => {
+      stdins.push(a.stdin ?? "");
+      const [name, , branch] = (a.stdin ?? "").trim().split(" ");
+      a.onOutput?.(`repo cloned ${name} ${branch === "-" ? "main" : branch} abc1234 /home/u/workspace/repos/${name}\n`);
+      return { exitCode: 0 };
+    },
+  };
+  const config = { api, template: "t", snapshotId: null, autoSuspendAfterSeconds: 300, opencodeProviders: [] };
+  await ops.provisionProject(config as never, executor as never, "host_1", (await projects.getProject("demo"))!, progress, new AbortController().signal);
+  assert.deepEqual(stdins, ["app https://github.com/acme/app.git dev\n", "lib https://github.com/acme/lib.git -\n"]);
+  assert.deepEqual(added, ["p_app host_1 /home/u/workspace/repos/app"]);
+
+  const failing = { exec: async (a: { onOutput?: (t: string) => void }) => (a.onOutput?.("repo failed app - - fatal:_Remote_branch_dev_not_found\n"), { exitCode: 4 }) };
+  await assert.rejects(ops.provisionProject(config as never, failing as never, "host_1", (await projects.getProject("demo"))!, progress, new AbortController().signal), /Cloning app .* failed: fatal:_Remote_branch_dev_not_found/);
 });
 
 test("cleanup by key deletes only machines labelled with that key", async () => {

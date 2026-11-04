@@ -6,6 +6,7 @@ import type { MachineBootstrapApi, MachineExecutor } from "@get-bb/plugin-sdk";
 import { daemonStopScript, hubHealthScript, identityResetScript, type OpencodeProvider, opencodeSyncScript, secretsEnvScript, staleConnectionsScript, tunnelSetupScript } from "./box-scripts.ts";
 import { InstaboxExecutor, runScript } from "./executor.ts";
 import { normalizeIdleSeconds } from "./idle.ts";
+import { branchMismatch, cloneInput, cloneRepoScript, type ClonedRepo, parseCloneResult, PROJECT_NAME_RE, type Project, type ProjectLite, planSources } from "./projects.ts";
 import { type InstaboxApi, isNotFound, isRunning, type Machine, type Operation, STOPPED_STATES, SUSPENDED_STATES } from "./instabox-api.ts";
 import type { TunnelManager } from "./tunnel.ts";
 
@@ -27,6 +28,8 @@ export const inputsSchema = z
     snapshotId: z.string().min(1).optional(),
     /** Per-machine override of the plugin's idle pause; 0 only on accounts that allow it. */
     autoSuspendAfterSeconds: z.number().int().min(0).max(86_400).optional(),
+    /** A plugin project (InstaBox page → Projects): its repos are cloned on the machine and registered as bb project sources. */
+    project: z.string().regex(PROJECT_NAME_RE).optional(),
   })
   .strict();
 export type InstaboxInputs = z.infer<typeof inputsSchema>;
@@ -39,6 +42,16 @@ export interface ProviderConfig {
   autoSuspendAfterSeconds: number | null;
   /** OpenAI-compatible providers whose live model lists go into OpenCode's config on the machine. */
   opencodeProviders: OpencodeProvider[];
+  /** Create a bb project for a cloned repo that no bb project matches by git remote. */
+  createMissingProjects?: boolean;
+}
+
+/** bb's project API, as far as project runners need it. */
+export interface ProjectsDeps {
+  getProject(name: string): Promise<Project | null>;
+  listProjects(): Promise<ProjectLite[]>;
+  addProjectSource(a: { projectId: string; hostId: string; path: string }): Promise<void>;
+  createProject(a: { name: string; hostId: string; path: string }): Promise<{ id: string }>;
 }
 
 /** Recorded before the create call so a crash in between can still be cleaned up. */
@@ -57,6 +70,8 @@ export interface ProviderDeps {
     set(key: string, v: AllocationIntent): Promise<void>;
     delete(key: string): Promise<void>;
   };
+  /** Project runners; absent: the `project` input is refused. */
+  projects?: ProjectsDeps;
   /** Per-machine chisel credential store (plugin kv). */
   tunnelAuth: { get(machineId: string): Promise<string>; delete(machineId: string): Promise<void> };
   log(m: string): void;
@@ -89,6 +104,14 @@ export class InstaboxMachineOps {
     const snapshotId = inputs?.snapshotId ?? c.snapshotId;
     const template = inputs?.template ?? c.template;
     const requestedIdle = inputs?.autoSuspendAfterSeconds ?? c.autoSuspendAfterSeconds;
+    // Check the project before allocating anything.
+    let project: Project | null = null;
+    if (inputs?.project) {
+      if (!this.d.projects) throw new Error("Project runners are not available in this plugin build");
+      project = await this.d.projects.getProject(inputs.project);
+      if (!project) throw new Error(`Unknown project "${inputs.project}" (InstaBox page → Projects lists them)`);
+      if (project.repos.length === 0) throw new Error(`Project "${project.name}" has no repos yet (InstaBox page → Projects)`);
+    }
     const autoSuspendAfterSeconds = requestedIdle === null || requestedIdle === undefined ? null : normalizeIdleSeconds(await c.api.me(signal), requestedIdle);
     report.step(snapshotId ? `Creating an InstaBox machine from snapshot ${snapshotId}` : `Creating an InstaBox machine from template ${template}`);
     const prior = await this.d.intents.get(key);
@@ -116,13 +139,13 @@ export class InstaboxMachineOps {
     await checkpoint(resource);
     this.inFlight.add(machineId);
     try {
-      return await this.finishCreate(c, key, resource, report, signal);
+      return await this.finishCreate(c, key, resource, project, report, signal);
     } finally {
       this.inFlight.delete(machineId);
     }
   }
 
-  private async finishCreate(c: ProviderConfig, key: string, resource: InstaboxResource, report: Progress, signal: AbortSignal) {
+  private async finishCreate(c: ProviderConfig, key: string, resource: InstaboxResource, project: Project | null, report: Progress, signal: AbortSignal) {
     const { machineId } = resource;
     report.step(`Waiting for ${machineId} to run`);
     const machine = await this.waitFor(c.api, machineId, isRunning, signal);
@@ -132,7 +155,10 @@ export class InstaboxMachineOps {
     await this.prepare(c, executor, machineId, report, signal);
     await this.connect(c, machineId, executor, report, signal);
     report.step("Enrolling the machine in bb");
-    await this.d.bootstrap({ key, executor, report, signal });
+    const { hostId } = await this.d.bootstrap({ key, executor, report, signal });
+    // Before returning: bb starts a thread only once the machine is created, and
+    // then looks for a project source on it.
+    if (project) await this.provisionProject(c, executor, hostId, project, report, signal);
     return { name: machine.name, resource };
   }
 
@@ -220,6 +246,56 @@ export class InstaboxMachineOps {
       this.d.log(`cleanup ${key}: deleted ${id}`);
     }
     await this.d.intents.delete(key);
+  }
+
+  /**
+   * Clone every repo of the project at its branch under ~/workspace/repos (one
+   * exec per repo, so each gets the full 600 s), then register the clones as bb
+   * project sources on this host. A failed clone fails the create.
+   */
+  async provisionProject(c: ProviderConfig, executor: MachineExecutor, hostId: string, project: Project, report: Progress, signal: AbortSignal): Promise<void> {
+    const cloned: ClonedRepo[] = [];
+    for (const repo of project.repos) {
+      report.step(`Cloning ${repo.name}${repo.branch ? ` at ${repo.branch}` : " (default branch)"} for project ${project.name}`);
+      let out = "";
+      const { exitCode } = await executor.exec({
+        command: ["bash", "-c", cloneRepoScript()],
+        stdin: cloneInput(repo),
+        timeoutMs: 600_000,
+        signal,
+        onOutput: (t) => {
+          out += t;
+        },
+      });
+      const res = parseCloneResult(out);
+      if (exitCode !== 0 || !res || res.state === "failed") throw new Error(`Cloning ${repo.name} (${repo.url}) failed: ${res?.detail ?? `exit ${exitCode}`}`);
+      report.log(`${repo.name}: ${res.state} on ${res.branch ?? "?"} at ${res.sha ?? "?"} → ${res.detail}`);
+      const mismatch = branchMismatch(repo, res);
+      if (mismatch) report.log(mismatch);
+      cloned.push({ name: repo.name, url: repo.url, path: res.detail });
+    }
+    await this.registerSources(c, cloned, hostId, report);
+  }
+
+  private async registerSources(c: ProviderConfig, repos: ClonedRepo[], hostId: string, report: Progress): Promise<void> {
+    const p = this.d.projects!;
+    const plan = planSources(repos, await p.listProjects(), hostId, c.createMissingProjects ?? false);
+    for (const a of plan) {
+      if (a.kind === "add") {
+        await p.addProjectSource({ projectId: a.projectId, hostId, path: a.path });
+        report.log(`bb project ${a.projectName}: source added on this machine at ${a.path}`);
+      } else if (a.kind === "present") {
+        report.log(`bb project ${a.projectName}: already has a source on this machine (${a.path})`);
+      } else if (a.kind === "create") {
+        const created = await p.createProject({ name: a.repo, hostId, path: a.path });
+        report.log(`bb project ${a.repo} created (${created.id}) from ${a.path}`);
+      } else if (a.kind === "unmatched") {
+        report.log(`${a.repo}: no bb project has the remote ${a.url}; cloned but not registered (setting createMissingProjects creates one)`);
+      } else {
+        report.log(`${a.repo}: several bb projects share its remote (${a.projectNames.join(", ")}); not registered`);
+      }
+    }
+    this.d.log(`project sources on ${hostId}: ${plan.map((a) => `${a.repo}=${a.kind}`).join(" ")}`);
   }
 
   /** Rewrite Pi's and OpenCode's provider configs on a running machine (after a settings change). */
