@@ -10,6 +10,9 @@ import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { idlePolicy, normalizeIdleSeconds } from "./idle.ts";
 import { type InstaboxApi, InstaboxApiError, isNotFound, isRunning, type Machine, type MachineMetric, STOPPED_STATES, SUSPENDED_STATES, TRANSITIONAL_STATES } from "./instabox-api.ts";
+import type { BranchListResult, RepoListResult } from "./github-repos.ts";
+import type { ProjectStore } from "./project-store.ts";
+import { PROJECT_NAME_RE, repoInputSchema } from "./projects.ts";
 import { PROVIDER_ID } from "./provider.ts";
 
 /** Realtime channel the page and sidebar badge listen on; published after every change. */
@@ -165,7 +168,36 @@ export const execResultDto = z.object({
 });
 export type ExecResultDto = z.infer<typeof execResultDto>;
 
+const projectDto = z.object({
+  name: z.string(),
+  repos: z.array(z.object({ name: z.string(), url: z.string(), branch: z.string().optional() })),
+});
+const repoListDto = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("ok"),
+    owners: z.array(z.string()),
+    repos: z.array(z.object({ owner: z.string(), name: z.string(), url: z.string(), isPrivate: z.boolean(), defaultBranch: z.string().nullable() })),
+    fetchedAt: z.number(),
+    cached: z.boolean(),
+  }),
+  z.object({ status: z.literal("unavailable"), reason: z.string() }),
+]);
+const branchListDto = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), defaultBranch: z.string().nullable(), branches: z.array(z.string()) }),
+  z.object({ status: z.literal("unavailable"), reason: z.string() }),
+]);
+
 export const dashboardRpc = defineRpcContract({
+  // Project runners (InstaBox page → Projects). Names and URLs only; never tokens.
+  projects_list: { input: z.null(), output: z.object({ projects: z.array(projectDto) }) },
+  project_create: { input: z.object({ name: z.string() }), output: projectDto },
+  project_rename: { input: z.object({ name: z.string(), newName: z.string() }), output: projectDto },
+  project_delete: { input: z.object({ name: z.string(), confirmName: z.string() }), output: z.object({ ok: z.literal(true) }) },
+  project_repo_add: { input: z.object({ project: z.string(), repo: repoInputSchema }), output: projectDto },
+  project_repo_update: { input: z.object({ project: z.string(), repoName: z.string(), repo: repoInputSchema }), output: projectDto },
+  project_repo_remove: { input: z.object({ project: z.string(), repoName: z.string() }), output: projectDto },
+  repos_list: { input: z.object({ refresh: z.boolean() }), output: repoListDto },
+  repo_branches: { input: z.object({ owner: z.string(), repo: z.string(), refresh: z.boolean() }), output: branchListDto },
   instabox_overview: { input: z.null(), output: overviewDto },
   instabox_summary: { input: z.null(), output: z.object({ running: z.number().nullable(), total: z.number().nullable() }) },
   instabox_idle_choices: { input: z.null(), output: idleChoicesDto },
@@ -202,6 +234,8 @@ export const dashboardRpc = defineRpcContract({
       /** null: InstaBox's account default. */
       idleSeconds: z.number().int().min(0).max(86_400).nullable(),
       asRunner: z.boolean(),
+      /** bb runners only: clone this plugin project's repos and register them in bb. */
+      project: z.string().regex(PROJECT_NAME_RE).nullable().optional(),
       requestId,
     }),
     output: createResult,
@@ -245,6 +279,8 @@ export interface DashboardDeps {
   now(): number;
   hubWarning?(): Promise<string | null>;
   cacheMs?: number;
+  projectStore?: ProjectStore;
+  github?: { repos(force: boolean): Promise<RepoListResult>; branches(owner: string, repo: string, force: boolean): Promise<BranchListResult> };
 }
 
 const msg = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -509,7 +545,32 @@ export function createDashboardHandlers(deps: DashboardDeps) {
     return value;
   }
 
+  const withStore = async <T>(fn: (s: ProjectStore) => Promise<T>): Promise<T> => {
+    if (!deps.projectStore) throw new Error("Project storage is not available in this plugin build");
+    const r = await fn(deps.projectStore);
+    deps.publish();
+    return r;
+  };
+  const github = () => {
+    if (!deps.github) throw new Error("The GitHub repo picker is not available in this plugin build");
+    return deps.github;
+  };
+
   return {
+    projects_list: async () => ({ projects: deps.projectStore ? await deps.projectStore.list() : [] }),
+    project_create: async ({ name }: { name: string }) => withStore((s) => s.create(name)),
+    project_rename: async ({ name, newName }: { name: string; newName: string }) => withStore((s) => s.rename(name, newName)),
+    project_delete: async ({ name, confirmName }: { name: string; confirmName: string }) => {
+      await withStore((s) => s.delete(name, confirmName));
+      return { ok: true as const };
+    },
+    project_repo_add: async ({ project, repo }: { project: string; repo: { name: string; url: string; branch?: string } }) => withStore((s) => s.addRepo(project, repo)),
+    project_repo_update: async ({ project, repoName, repo }: { project: string; repoName: string; repo: { name: string; url: string; branch?: string } }) =>
+      withStore((s) => s.updateRepo(project, repoName, repo)),
+    project_repo_remove: async ({ project, repoName }: { project: string; repoName: string }) => withStore((s) => s.removeRepo(project, repoName)),
+    repos_list: async ({ refresh }: { refresh: boolean }) => github().repos(refresh),
+    repo_branches: async ({ owner, repo, refresh }: { owner: string; repo: string; refresh: boolean }) => github().branches(owner, repo, refresh),
+
     instabox_overview: async () => overview(),
 
     instabox_summary: async () => {
@@ -626,18 +687,27 @@ export function createDashboardHandlers(deps: DashboardDeps) {
       source,
       idleSeconds,
       asRunner,
+      project,
       requestId: req,
     }: {
       name: string | null;
       source: { kind: "template"; templateId: string } | { kind: "snapshot"; snapshotId: string };
       idleSeconds: number | null;
       asRunner: boolean;
+      project?: string | null;
       requestId: string;
     }) => {
+      if (project && !asRunner) throw new Error("A project needs a bb runner: tick \"Create as a bb runner\"");
       if (asRunner) {
         if (!deps.createMachine) throw new Error("bb machine creation is not available in this plugin build");
         const inputs: Record<string, unknown> = source.kind === "template" ? { template: source.templateId } : { snapshotId: source.snapshotId };
         if (idleSeconds !== null) inputs.autoSuspendAfterSeconds = idleSeconds;
+        if (project) {
+          const p = deps.projectStore ? await deps.projectStore.get(project) : null;
+          if (!p) throw new Error(`Unknown project "${project}"`);
+          if (p.repos.length === 0) throw new Error(`Project "${p.name}" has no repos yet`);
+          inputs.project = p.name;
+        }
         const host = await deps.createMachine({ key: `instabox-page-${req}`, inputs });
         changed();
         return {

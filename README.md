@@ -97,6 +97,8 @@ Per-project secrets: `printf %s "$VALUE" | bb machine env set NAME --project <pr
 | `snapshotId` | empty | Create machines from a snapshot instead |
 | `idlePauseSeconds` | `300` | `autoSuspendAfterSeconds` for new machines. `0` sends nothing (InstaBox's account default); it does not turn the pause off. Each machine can be changed on the InstaBox page |
 | `opencodeProviders` | the eight org-Secret providers below | JSON array `[{"id","name"?,"baseURL","keyEnv"}]` of OpenAI-compatible providers for Pi and OpenCode (see [Keys on runners](#keys-on-runners)) |
+| `githubOwners` | empty | Comma list of GitHub owners for the Projects repo picker. Empty: `WyrdWerk` plus the account `gh` on the hub is logged in as |
+| `createMissingProjects` | off | Project runners: create a bb project for a cloned repo whose remote matches none |
 | `boxHubPort` | `38886` | Must match `machineServerUrl`; reload the plugin after changing it |
 
 Environment compositions `instabox` (git worktree) and `instabox-checkout`
@@ -189,10 +191,30 @@ machines get GitHub's current code, not the hub's copy. Private repos use the hu
 login, which bb passes to remote machines; with a `GH_TOKEN` org Secret, `gh` works on the
 machine too.
 
+### Project runners
+
+A **project** (InstaBox page → Projects) is a name plus a set of GitHub repos, each with an
+optional branch. The repo picker lists `gh repo list <owner>` on the hub for the
+`githubOwners` setting, and the branch picker lists that repo's branches through `gh api`
+(default branch first); `gh` must be logged in on the hub, and no token reaches the page.
+Manual URL and branch entry works when `gh` is unavailable.
+
+Choose a project when creating a bb runner on the InstaBox page, or in the Project field of
+bb's machine inputs (New Thread / machine create, or `--machine-inputs '{"project":"<name>"}'`).
+After enrolling, the plugin clones every repo into `~/workspace/repos/<name>` at its branch
+(the default branch when empty) and registers each clone as a source of the bb project with
+the same git remote on that machine (`createMissingProjects` creates one when none matches).
+A failed clone fails the create. An existing clone is left as it is, and a branch mismatch
+is only reported.
+
+Private repos clone through the machine's `GH_TOKEN` org Secret placeholder, offered by a
+one-off `git -c credential.helper=…` for that clone only; InstaBox's proxy swaps in the
+real token. Nothing is written into the remote URL or any git config.
+
 ## The InstaBox page
 
 The plugin adds an **InstaBox** page to bb's sidebar. It shows the account (tier, usage),
-machines (with the bb host each one backs), snapshots and templates, and offers: pause,
+machines (with the bb host each one backs), snapshots, templates and projects, and offers: pause,
 resume, stop, start, snapshot, create (plain, or as a bb runner), rename, the idle pause
 per machine (the choices from InstaBox's `GET /v1/me`; "off" only on accounts with manual
 lifecycle), delete a machine or a snapshot (type its name to confirm), and a command box
