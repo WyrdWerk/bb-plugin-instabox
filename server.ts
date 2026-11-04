@@ -6,11 +6,14 @@
 // access must point machines at that tunnel: `machineServerUrl
 // http://127.0.0.1:<boxHubPort>` (default 38886). See README.md.
 import { join } from "node:path";
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { z } from "zod";
+import type { BbPluginApi, JsonValue } from "@get-bb/plugin-sdk";
 import { DEFAULT_API_URL, InstaboxApi, type FetchLike, isRunning } from "./src/instabox-api.ts";
 import { type AllocationIntent, InstaboxMachineOps, inputsSchema, PROVIDER_ID, type ProviderConfig, resourceSchema } from "./src/provider.ts";
 import { TunnelManager } from "./src/tunnel.ts";
-import { parseAgentSecrets, parseOpencodeProviders } from "./src/box-scripts.ts";
+import { parseOpencodeProviders } from "./src/box-scripts.ts";
+import { ActivityLeases, IdleWatch } from "./src/activity.ts";
+import { createDashboardHandlers, dashboardRpc, INSTABOX_CHANGED } from "./src/dashboard.ts";
 
 const COMPOSITIONS = [
   {
@@ -34,7 +37,7 @@ export default async function plugin(bb: BbPluginApi) {
     apiKey: {
       type: "string",
       label: "InstaBox API key",
-      description: "An ibk_… key from the InstaBox dashboard. Stored as a secret. Empty: the bb server's INSTABOX_API_KEY environment variable.",
+      description: "An ibk_… key from the InstaBox dashboard. Required. Stored as a secret on this hub and masked after saving; there is no environment-variable or command-line fallback.",
       secret: true,
     },
     template: {
@@ -46,35 +49,24 @@ export default async function plugin(bb: BbPluginApi) {
     snapshotId: {
       type: "string",
       label: "Snapshot id (optional)",
-      description: "Create new machines from this InstaBox snapshot instead of the template.",
+      description: "Create new machines from this InstaBox snapshot instead of the template. A runner snapshot should hold no logins or keys; snapshots include /data/home.",
       default: "",
     },
-    zaiApiKey: {
-      type: "string",
-      label: "Z.ai API key for Claude Code",
+    idlePauseSeconds: {
+      type: "number",
+      label: "Idle pause for new machines (seconds)",
       description:
-        "Given to the bb daemon on each machine as ANTHROPIC_AUTH_TOKEN, with ANTHROPIC_BASE_URL set to the Z.ai endpoint, so the claude-code provider runs on Z.ai's GLM models. Stored as a secret. Empty: the bb server's ZAI_API_KEY environment variable.",
-      secret: true,
-    },
-    agentSecrets: {
-      type: "string",
-      label: "Extra secrets for agents on every machine",
-      description:
-        'One-line JSON object of NAME → value, e.g. {"GH_TOKEN":"…","OPENAI_API_KEY":"…"}. Written to each machine\'s bb daemon environment (0600 file) on create and resume, and re-applied to running machines when changed, which restarts their bb daemon. Stored as a secret. Per-project values: use bb machine env set --project instead.',
-      secret: true,
+        "Default autoSuspendAfterSeconds on machines this plugin creates. 300 = 5 min. 0 sends nothing and leaves InstaBox's account default alone; it does not turn the pause off. Each machine can be changed on the InstaBox page. A connected runner is paused by this plugin (through bb) once no bb thread on it has been starting or active for this long, because InstaBox counts the tunnel\'s SSH traffic as activity; the next message resumes it. While a thread works the plugin also holds an InstaBox activity lease.",
+      default: 300,
+      experimental_schema: z.number().int().min(0).max(86_400),
     },
     opencodeProviders: {
       type: "string",
       label: "OpenCode providers (model lists fetched live)",
       description:
-        'JSON array of OpenAI-compatible providers: [{"id":"zro","baseURL":"https://zro.moonmath.ai/v1","keyEnv":"ZRO_API_KEY"}]. On each machine the plugin calls <baseURL>/models with the key from that env var (Z.ai key or agentSecrets) and writes OpenCode\'s config from the result; providers without a key are skipped. Refreshed on create, resume and credential changes. Empty: Z.ai coding plan, zro, coralbricks, neuralwatt.',
+        'JSON array of OpenAI-compatible providers: [{"id":"zro","baseURL":"https://zro.moonmath.ai/v1","keyEnv":"ZRO_API_KEY"}]. On each machine the plugin calls <baseURL>/models with the org Secret placeholder in that env var and writes OpenCode\'s and Pi\'s configs from the result; providers without a key are skipped. Refreshed on create, resume and provider changes. Empty: the eight providers backed by this org\'s Secrets (Z.ai, zro, coralbricks, neuralwatt, deepseek, hypercharm, singularity, runinfra).',
       experimental_multiline: true,
       default: "",
-    },
-    zaiBaseUrl: {
-      type: "string",
-      label: "Z.ai Anthropic-compatible endpoint",
-      default: "https://api.z.ai/api/anthropic",
     },
     boxHubPort: {
       type: "number",
@@ -88,33 +80,42 @@ export default async function plugin(bb: BbPluginApi) {
   const boxHubPort = Math.round(s0.boxHubPort);
   const tunnelUrl = `http://127.0.0.1:${boxHubPort}`;
 
-  async function config(): Promise<ProviderConfig> {
+  async function configOrError(): Promise<ProviderConfig | { error: string }> {
     const s = await settings.get();
-    const apiKey = s.apiKey || process.env.INSTABOX_API_KEY || "";
-    if (!apiKey) throw Object.assign(new Error("Set the InstaBox API key in the plugin settings."), { name: "NeedsConfigurationError" });
-    const zai = s.zaiApiKey || process.env.ZAI_API_KEY || "";
+    const apiKey = s.apiKey || "";
+    if (!apiKey) return { error: "Add your InstaBox API key in Settings → Plugins → InstaBox." };
+    const idle = Math.round(s.idlePauseSeconds ?? 300);
     return {
       api: new InstaboxApi(apiKey, fetch as unknown as FetchLike, process.env.INSTABOX_API_URL || DEFAULT_API_URL),
       template: s.template || "agent-browser",
       snapshotId: s.snapshotId || null,
-      // ZAI_API_KEY too, so pi and OpenCode can use their built-in Z.ai providers. User secrets win.
-      agentEnv: {
-        ...(zai ? { ANTHROPIC_BASE_URL: s.zaiBaseUrl, ANTHROPIC_AUTH_TOKEN: zai, API_TIMEOUT_MS: "3000000", ZAI_API_KEY: zai } : {}),
-        ...parseAgentSecrets(s.agentSecrets ?? ""),
-      },
+      // 0 = send nothing: InstaBox's account default. It does not mean "off".
+      autoSuspendAfterSeconds: idle > 0 ? idle : null,
       opencodeProviders: parseOpencodeProviders(s.opencodeProviders ?? ""),
     };
   }
 
+  async function config(): Promise<ProviderConfig> {
+    const c = await configOrError();
+    if ("error" in c) throw Object.assign(new Error(c.error), { name: "NeedsConfigurationError" });
+    return c;
+  }
+
   /** Setup problems a user can fix: missing key, or bb not pointing machines at the tunnel. */
   async function setupProblem(): Promise<string | null> {
-    const s = await settings.get();
-    if (!s.apiKey && !process.env.INSTABOX_API_KEY) return "Set the InstaBox API key in the plugin settings.";
+    const c = await configOrError();
+    if ("error" in c) return c.error;
     const access = (await bb.sdk.system.config()).serverAccess;
     if (access.defaultProviderId !== "direct" || access.effectiveUrl !== tunnelUrl) {
       return `InstaBox machines reach this hub through a tunnel at ${tunnelUrl}. Run: bb settings general defaultMachineAccess direct && bb settings general machineServerUrl ${tunnelUrl}`;
     }
     return null;
+  }
+
+  async function hubWarning(): Promise<string | null> {
+    const access = (await bb.sdk.system.config()).serverAccess;
+    if (access.defaultProviderId === "direct" && access.effectiveUrl === tunnelUrl) return null;
+    return `bb is handing machines ${access.effectiveUrl ?? "(no URL)"} (${access.defaultProviderId ?? "no provider"}), not the InstaBox tunnel ${tunnelUrl}. New InstaBox runners will not connect until you run: bb settings general defaultMachineAccess direct && bb settings general machineServerUrl ${tunnelUrl}`;
   }
 
   const authKey = (machineId: string) => `tunnel-auth/${machineId}`;
@@ -212,54 +213,84 @@ export default async function plugin(bb: BbPluginApi) {
   for (const c of COMPOSITIONS) bb.experimental_environments.register({ ...c, icon: "./instabox.svg", machineProviderId: PROVIDER_ID });
 
   // Supervisor: keep a tunnel up for every running InstaBox machine bb knows
-  // (after a bb restart, a dropped SSH session, or a certificate near expiry).
-  // A machine InstaBox paused on its own (idle pause) is marked suspended in bb,
-  // so bb resumes it through this provider when it is needed again.
+  // (after a bb restart, a dropped SSH session, or a certificate near expiry),
+  // and hold an InstaBox activity lease while a bb thread is working on it.
+  // A machine InstaBox paused on its own (idle pause) is marked suspended in
+  // bb, so bb resumes it through this provider when it is needed again.
+  const leases = new ActivityLeases();
+  const idle = new IdleWatch();
   let busy = false;
+  const busyThreads = async (hostId: string) =>
+    (await bb.sdk.threads.count({ hostId, status: "starting" })).total + (await bb.sdk.threads.count({ hostId, status: "active" })).total;
   const supervise = async () => {
     if (busy) return;
     busy = true;
+    const ours = new Set<string>();
     try {
       const c = await config();
-      const ours = new Set<string>();
       for (const h of await bb.sdk.hosts.list()) {
         if (h.machineProviderId !== PROVIDER_ID) continue;
         const parsed = resourceSchema.safeParse(await bb.experimental_machines.getResource(h.id));
         if (!parsed.success) continue;
         const id = parsed.data.machineId;
         const phase = h.lifecycle.phase;
-        if (phase === "destroyed" || phase === "removing") continue;
+        if (phase === "destroyed" || phase === "removing") {
+          leases.forget(id);
+          idle.forget(id);
+          continue;
+        }
         ours.add(id);
-        if (phase !== "active") continue; // creating/suspending/resuming: the provider call owns the tunnel
+        if (phase !== "active") {
+          // creating/suspending/resuming: the provider call owns the tunnel and
+          // there is no turn to protect. Any lease we held expires by itself.
+          leases.forget(id);
+          idle.forget(id);
+          continue;
+        }
         const m = await c.api.findMachine(id);
         if (m && isRunning(m)) {
           await tunnels.ensure(c.api, id).catch((err) => bb.log.warn(`tunnel ${id}: ${message(err)}`));
+          const n = await busyThreads(h.id);
+          await leases.sync(c.api, id, h.id, n > 0).catch((err) => bb.log.warn(`activity lease ${id}: ${message(err)}`));
+          if (idle.observe(id, n > 0, m.autoSuspendAfterSeconds, Date.now())) {
+            idle.forget(id);
+            bb.log.info(`${id}: no bb thread busy for ${m.autoSuspendAfterSeconds}s (its idle pause); pausing ${h.id}`);
+            await bb.sdk.hosts.experimental_suspend({ hostId: h.id }).catch((err) => bb.log.warn(`idle pause ${h.id}: ${message(err)}`));
+            bb.realtime.publish(INSTABOX_CHANGED, {});
+          }
         } else if (m && (m.state === "suspended" || m.state === "stopped")) {
+          leases.forget(id);
+          idle.forget(id);
           tunnels.stop(id);
           bb.log.info(`${id} is ${m.state} on InstaBox (idle pause?); marking ${h.id} suspended in bb`);
           await bb.sdk.hosts.experimental_suspend({ hostId: h.id }).catch((err) => bb.log.warn(`suspend ${h.id}: ${message(err)}`));
+          bb.realtime.publish(INSTABOX_CHANGED, {});
         }
       }
-      for (const id of tunnels.active()) if (!ours.has(id)) tunnels.stop(id);
+      // Orphans only: a create or resume in progress owns its tunnel even before bb lists its resource.
+      for (const id of tunnels.active()) if (!ours.has(id) && !ops.inFlight.has(id)) tunnels.stop(id);
+      leases.retain(ours);
+      idle.retain(ours);
     } catch (err) {
       if ((err as Error).name !== "NeedsConfigurationError") bb.log.warn(`InstaBox supervisor: ${message(err)}`);
     } finally {
       busy = false;
     }
   };
-  // Credential settings changed: re-apply the agent env on every running InstaBox machine.
+  // Provider list changed: rewrite Pi's and OpenCode's configs on every running InstaBox machine.
   settings.onChange((next, prev) => {
-    if (next.agentSecrets === prev.agentSecrets && next.zaiApiKey === prev.zaiApiKey && next.zaiBaseUrl === prev.zaiBaseUrl && next.opencodeProviders === prev.opencodeProviders) return;
+    if (next.opencodeProviders === prev.opencodeProviders) return;
     void (async () => {
       for (const h of await bb.sdk.hosts.list()) {
         if (h.machineProviderId !== PROVIDER_ID || h.lifecycle.phase !== "active") continue;
         const parsed = resourceSchema.safeParse(await bb.experimental_machines.getResource(h.id));
         if (!parsed.success) continue;
         await ops
-          .applyAgentEnv(parsed.data.machineId, AbortSignal.timeout(120_000))
+          .applyAgentConfig(parsed.data.machineId, AbortSignal.timeout(120_000))
           .then((line) => bb.log.info(`${h.id}: ${line}`))
-          .catch((err) => bb.log.warn(`agent env ${h.id}: ${message(err)}`));
+          .catch((err) => bb.log.warn(`agent config ${h.id}: ${message(err)}`));
       }
+      bb.realtime.publish(INSTABOX_CHANGED, {});
     })();
   });
 
@@ -267,8 +298,47 @@ export default async function plugin(bb: BbPluginApi) {
   setTimeout(() => void supervise(), 2000);
   bb.onDispose(() => {
     clearInterval(timer);
+    leases.clear();
     tunnels.stopAll();
   });
 
-  if (!s0.apiKey && !process.env.INSTABOX_API_KEY) bb.status.needsConfiguration("Set the InstaBox API key in the plugin settings.");
+  // InstaBox page (app.tsx): data and actions over typed RPC; the key never
+  // leaves the server, and exec output is redacted before it does.
+  bb.rpc.register(
+    dashboardRpc,
+    createDashboardHandlers({
+      client: async () => {
+        const c = await configOrError();
+        return "error" in c ? c : { api: c.api };
+      },
+      settings: async () => {
+        const s = await settings.get();
+        return {
+          apiKey: s.apiKey || "",
+          snapshotId: s.snapshotId ?? "",
+          template: s.template || "agent-browser",
+          idlePauseSeconds: Math.round(s.idlePauseSeconds ?? 300),
+        };
+      },
+      hosts: async () =>
+        (await bb.sdk.hosts.list()).map((h) => ({
+          id: h.id,
+          name: h.name,
+          status: h.status,
+          machineProviderId: h.machineProviderId,
+          phase: h.lifecycle.phase,
+        })),
+      getResource: (hostId) => bb.experimental_machines.getResource(hostId),
+      createMachine: async ({ key, inputs }) => {
+        const h = await bb.sdk.hosts.experimental_create({ machineProviderId: PROVIDER_ID, key, inputs: inputs as JsonValue, wait: false });
+        return { hostId: h.id, name: h.name ?? null };
+      },
+      publish: () => bb.realtime.publish(INSTABOX_CHANGED, {}),
+      now: () => Date.now(),
+      hubWarning,
+    }),
+  );
+
+  const c = await configOrError();
+  if ("error" in c) bb.status.needsConfiguration(c.error);
 }

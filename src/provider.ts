@@ -3,8 +3,9 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { MachineBootstrapApi, MachineExecutor } from "@get-bb/plugin-sdk";
-import { agentEnvContent, agentEnvScript, hubHealthScript, identityResetScript, type OpencodeProvider, opencodeSyncScript, staleConnectionsScript, tunnelSetupScript } from "./box-scripts.ts";
+import { daemonStopScript, hubHealthScript, identityResetScript, type OpencodeProvider, opencodeSyncScript, secretsEnvScript, staleConnectionsScript, tunnelSetupScript } from "./box-scripts.ts";
 import { InstaboxExecutor, runScript } from "./executor.ts";
+import { normalizeIdleSeconds } from "./idle.ts";
 import { type InstaboxApi, isNotFound, isRunning, type Machine, type Operation, STOPPED_STATES, SUSPENDED_STATES } from "./instabox-api.ts";
 import type { TunnelManager } from "./tunnel.ts";
 
@@ -24,6 +25,8 @@ export const inputsSchema = z
   .object({
     template: z.string().min(1).optional(),
     snapshotId: z.string().min(1).optional(),
+    /** Per-machine override of the plugin's idle pause; 0 only on accounts that allow it. */
+    autoSuspendAfterSeconds: z.number().int().min(0).max(86_400).optional(),
   })
   .strict();
 export type InstaboxInputs = z.infer<typeof inputsSchema>;
@@ -32,8 +35,8 @@ export interface ProviderConfig {
   api: InstaboxApi;
   template: string;
   snapshotId: string | null;
-  /** KEY=value pairs for the bb daemon (agent credentials). */
-  agentEnv: Record<string, string>;
+  /** Default idle pause for new machines; null leaves InstaBox's own default alone. */
+  autoSuspendAfterSeconds: number | null;
   /** OpenAI-compatible providers whose live model lists go into OpenCode's config on the machine. */
   opencodeProviders: OpencodeProvider[];
 }
@@ -71,6 +74,8 @@ export const metadataFor = (key: string) => ({ "bb-provider": PROVIDER_ID, "bb-k
 
 export class InstaboxMachineOps {
   private readonly d: ProviderDeps;
+  /** Machines with a create or resume in progress: their tunnel belongs to that call, not the supervisor. */
+  readonly inFlight = new Set<string>();
   constructor(deps: ProviderDeps) {
     this.d = deps;
   }
@@ -83,12 +88,22 @@ export class InstaboxMachineOps {
     const c = await this.d.config();
     const snapshotId = inputs?.snapshotId ?? c.snapshotId;
     const template = inputs?.template ?? c.template;
+    const requestedIdle = inputs?.autoSuspendAfterSeconds ?? c.autoSuspendAfterSeconds;
+    const autoSuspendAfterSeconds = requestedIdle === null || requestedIdle === undefined ? null : normalizeIdleSeconds(await c.api.me(signal), requestedIdle);
     report.step(snapshotId ? `Creating an InstaBox machine from snapshot ${snapshotId}` : `Creating an InstaBox machine from template ${template}`);
     const prior = await this.d.intents.get(key);
     await this.d.intents.set(key, { operationId: prior?.operationId ?? null, machineId: prior?.machineId ?? null });
     let machineId = prior?.machineId ?? null;
     if (!machineId) {
-      const body = { name: machineNameFor(key), metadata: metadataFor(key), ...(snapshotId ? { snapshotId } : { templateId: template }) };
+      const body = {
+        name: machineNameFor(key),
+        metadata: metadataFor(key),
+        // API creates select no org Secrets unless asked. "all" covers every
+        // proxy Secret now and those added later; the guest sees placeholders.
+        secrets: "all" as const,
+        ...(snapshotId ? { snapshotId } : { templateId: template }),
+        ...(autoSuspendAfterSeconds !== null ? { autoSuspendAfterSeconds } : {}),
+      };
       // Same key → same Idempotency-Key → InstaBox returns the same operation on a retry.
       const op = await c.api.createMachine(body, `bb-create-${keyHash(key).slice(0, 48)}`, signal);
       await this.d.intents.set(key, { operationId: op.id, machineId: op.machineId ?? null });
@@ -99,6 +114,16 @@ export class InstaboxMachineOps {
     }
     const resource: InstaboxResource = { machineId, key };
     await checkpoint(resource);
+    this.inFlight.add(machineId);
+    try {
+      return await this.finishCreate(c, key, resource, report, signal);
+    } finally {
+      this.inFlight.delete(machineId);
+    }
+  }
+
+  private async finishCreate(c: ProviderConfig, key: string, resource: InstaboxResource, report: Progress, signal: AbortSignal) {
+    const { machineId } = resource;
     report.step(`Waiting for ${machineId} to run`);
     const machine = await this.waitFor(c.api, machineId, isRunning, signal);
     const executor = new InstaboxExecutor(c.api, machineId);
@@ -119,6 +144,8 @@ export class InstaboxMachineOps {
     if (!SUSPENDED_STATES.has(m.state) && !STOPPED_STATES.has(m.state)) {
       if (m.state !== "running") m = await this.waitFor(api, m.id, (x) => x.state === "running" || SUSPENDED_STATES.has(x.state) || STOPPED_STATES.has(x.state), signal);
       if (m.state === "running") {
+        report.step("Stopping the bb daemon on the machine");
+        report.log(lastLine(await runScript(new InstaboxExecutor(api, m.id), daemonStopScript(), signal, { what: "daemon stop", timeoutMs: 60_000 }).catch((err) => `daemon stop skipped: ${(err as Error).message}`)));
         report.step(`Pausing ${m.id} (memory, files and processes are kept)`);
         await this.waitOperation(api, await api.lifecycle(m.id, "suspend", signal), signal);
       }
@@ -128,6 +155,15 @@ export class InstaboxMachineOps {
   }
 
   async resume(resource: InstaboxResource, report: Progress, signal: AbortSignal): Promise<InstaboxResource> {
+    this.inFlight.add(resource.machineId);
+    try {
+      return await this.doResume(resource, report, signal);
+    } finally {
+      this.inFlight.delete(resource.machineId);
+    }
+  }
+
+  private async doResume(resource: InstaboxResource, report: Progress, signal: AbortSignal): Promise<InstaboxResource> {
     const c = await this.d.config();
     const { api } = c;
     let m = await api.findMachine(resource.machineId, signal);
@@ -144,6 +180,9 @@ export class InstaboxMachineOps {
     }
     await this.waitFor(api, m.id, isRunning, signal);
     const executor = new InstaboxExecutor(api, m.id);
+    // bb rejects this host's daemon until bootstrap below; whatever survived the pause is stale.
+    report.step("Stopping any bb daemon left from before the pause");
+    report.log(lastLine(await runScript(executor, daemonStopScript(), signal, { what: "daemon stop", timeoutMs: 60_000 })));
     report.step("Closing network connections that did not survive the pause");
     report.log(lastLine(await runScript(executor, staleConnectionsScript(), signal, { what: "stale connection reset" })));
     await this.prepare(c, executor, m.id, report, signal);
@@ -183,28 +222,49 @@ export class InstaboxMachineOps {
     await this.d.intents.delete(key);
   }
 
-  /** Rewrite the agent env on a running machine (after a settings change). Returns the script's last line. */
-  async applyAgentEnv(machineId: string, signal: AbortSignal): Promise<string> {
+  /** Rewrite Pi's and OpenCode's provider configs on a running machine (after a settings change). */
+  async applyAgentConfig(machineId: string, signal: AbortSignal): Promise<string> {
     const c = await this.d.config();
-    const executor = new InstaboxExecutor(c.api, machineId);
-    const env = lastLine(await runScript(executor, agentEnvScript(), signal, { stdin: agentEnvContent(c.agentEnv), what: "agent env" }));
-    return `${env} ${await this.syncOpencode(c, executor, signal)}`;
+    return this.syncOpencode(c, new InstaboxExecutor(c.api, machineId), signal);
   }
 
-  /** Rebuild OpenCode's provider config from each provider's live /models (on the machine, with its keys). */
+  /** Rebuild OpenCode's and Pi's provider configs from each provider's live /models (on the machine, with its placeholders). */
   private async syncOpencode(c: ProviderConfig, executor: MachineExecutor, signal: AbortSignal): Promise<string> {
     return lastLine(await runScript(executor, opencodeSyncScript(), signal, { stdin: JSON.stringify(c.opencodeProviders), what: "opencode config", timeoutMs: 120_000 }));
   }
 
-  /** Box side of the tunnel plus the agent credentials. Idempotent. */
+  /** Select every proxy Secret and wait until both delivery paths report applied. */
+  private async ensureSecrets(api: InstaboxApi, machineId: string, report: Progress, signal: AbortSignal) {
+    report.step("Selecting this org's proxy Secrets on the machine");
+    let s = await api.getSecrets(machineId, signal).catch(() => null);
+    if (!s || s.secrets !== "all") s = await api.updateSecrets(machineId, { secrets: "all" }, signal);
+    const applied = (x: typeof s) => !!x && x.guest?.state === "applied" && x.proxy?.state === "applied";
+    if (!applied(s)) s = await api.pushSecrets(machineId, signal).catch(() => s);
+    const until = Date.now() + 90_000;
+    while (!applied(s)) {
+      if (s?.guest?.state === "error" || s?.proxy?.state === "error") {
+        throw new Error(`InstaBox Secret delivery failed (guest=${s.guest?.state ?? "?"}, proxy=${s.proxy?.state ?? "?"}): ${s.guest?.error ?? "see machine secrets"}`);
+      }
+      if (Date.now() > until) {
+        // An org with no proxy Secrets can legitimately stay inactive.
+        if ((s?.items ?? []).length === 0) break;
+        throw new Error(`InstaBox Secret delivery not applied after 90 s (guest=${s?.guest?.state ?? "?"}, proxy=${s?.proxy?.state ?? "?"})`);
+      }
+      await this.d.sleep(1_500, signal);
+      s = await api.getSecrets(machineId, signal);
+    }
+    report.log(`secrets=${s?.guest?.state ?? "none"}/${s?.proxy?.state ?? "none"} selected=${s?.items?.length ?? 0}`);
+  }
+
+  /** Box side of the tunnel, the org Secret environment, and Pi/OpenCode provider configs. Idempotent. */
   private async prepare(c: ProviderConfig, executor: MachineExecutor, machineId: string, report: Progress, signal: AbortSignal) {
+    await this.ensureSecrets(c.api, machineId, report, signal);
     report.step("Setting up the tunnel endpoint on the machine");
     const auth = await this.d.tunnelAuth.get(machineId);
     report.log(lastLine(await runScript(executor, tunnelSetupScript(), signal, { stdin: `AUTH=${auth}\n`, what: "tunnel setup", timeoutMs: 180_000 })));
-    const names = Object.keys(c.agentEnv);
-    report.step(`Giving the bb daemon its agent credentials (${names.length ? names.join(", ") : "none configured"})`);
-    report.log(lastLine(await runScript(executor, agentEnvScript(), signal, { stdin: agentEnvContent(c.agentEnv), what: "agent env" })));
-    report.step("Fetching model lists for OpenCode");
+    report.step("Giving the bb daemon the org Secret placeholders");
+    report.log(lastLine(await runScript(executor, secretsEnvScript(), signal, { what: "secrets env" })));
+    report.step("Fetching model lists for Pi and OpenCode");
     report.log(await this.syncOpencode(c, executor, signal));
   }
 

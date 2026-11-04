@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { agentEnvContent, opencodeSyncScript, parseAgentSecrets, parseOpencodeProviders } from "../src/box-scripts.ts";
+import { OPENCODE_TEMPLATE_HASHES, opencodeSyncScript, parseOpencodeProviders, secretsEnvScript } from "../src/box-scripts.ts";
 import { shellQuote } from "../src/executor.ts";
 import type { InstaboxApi, Machine, Operation } from "../src/instabox-api.ts";
 import { InstaboxMachineOps, metadataFor } from "../src/provider.ts";
@@ -17,30 +18,35 @@ test("shellQuote: bash sees exactly the original argv", () => {
   assert.equal(out, argv.slice(1).map((a) => `<${a}>`).join(""));
 });
 
-test("agentEnvContent refuses values that would inject extra lines", () => {
-  assert.equal(agentEnvContent({ A: "x.y", B: "z" }), "A=x.y\nB=z\n");
-  assert.throws(() => agentEnvContent({ A: "x\nEVIL=1" }));
-  assert.throws(() => agentEnvContent({ "A B": "x" }));
-});
-
-test("parseAgentSecrets accepts a JSON object of strings and rejects anything that could smuggle lines", () => {
-  assert.deepEqual(parseAgentSecrets(""), {});
-  assert.deepEqual(parseAgentSecrets('{"GH_TOKEN":"ghp_x","B":"a=b c"}'), { GH_TOKEN: "ghp_x", B: "a=b c" });
-  assert.throws(() => parseAgentSecrets("GH_TOKEN=x"));
-  assert.throws(() => parseAgentSecrets('["x"]'));
-  assert.throws(() => parseAgentSecrets('{"N":1}'));
-  assert.throws(() => parseAgentSecrets('{"A":"x\\nEVIL=1"}'));
-  assert.throws(() => parseAgentSecrets('{"A;rm":"x"}'));
+test("secretsEnvScript turns the guest's shell-syntax Secret file into plain daemon env lines and drops the old agent env", () => {
+  const home = mkdtempSync(join(tmpdir(), "ib-se-"));
+  const bin = join(home, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "systemctl"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  const guest = join(home, "guest.env");
+  writeFileSync(guest, 'export ZAI_API_KEY=ibsec_zai\nGH_TOKEN="ibsec_gh"\nODD=\'a"b\'\n');
+  mkdirSync(join(home, ".config/bb-instabox"), { recursive: true });
+  writeFileSync(join(home, ".config/bb-instabox/agent.env"), "ANTHROPIC_AUTH_TOKEN=old\n");
+  const run = () =>
+    execFileSync("bash", ["-c", secretsEnvScript()], { cwd: home, env: { HOME: home, PATH: `${bin}:${process.env.PATH}`, BB_INSTABOX_SECRETS_FILE: guest } }).toString().trim();
+  assert.match(run(), /^secrets-env=ok vars=2 skipped=1 changed=yes/);
+  assert.equal(readFileSync(join(home, ".config/bb-instabox/secrets.env"), "utf8"), "GH_TOKEN=ibsec_gh\nZAI_API_KEY=ibsec_zai\n");
+  assert.ok(!existsSync(join(home, ".config/bb-instabox/agent.env")));
+  const dropin = readFileSync(join(home, ".config/systemd/user/bb-host-daemon-.service.d/20-bb-instabox-secrets-env.conf"), "utf8");
+  assert.equal(dropin, "[Service]\nEnvironmentFile=-%h/.config/bb-instabox/secrets.env\n");
+  assert.match(run(), /changed=no restarted=0$/);
 });
 
 /** Fake InstaBox: records calls; machines appear when their create op is read. */
 function fakeApi() {
   const machines = new Map<string, Machine>();
   const calls: string[] = [];
+  const createBodies: Record<string, unknown>[] = [];
   let n = 0;
   const api = {
     createMachine: async (body: { name: string; metadata: Record<string, string> }, idem: string): Promise<Operation> => {
       calls.push(`create ${idem}`);
+      createBodies.push(body as unknown as Record<string, unknown>);
       const id = `m_${++n}`;
       machines.set(id, { id, name: body.name, state: "running", operationId: null, runtime: { ready: true }, metadata: body.metadata });
       return { id: `op_${n}`, machineId: id, type: "create", state: "succeeded", error: null };
@@ -48,6 +54,19 @@ function fakeApi() {
     getOperation: async (id: string): Promise<Operation> => ({ id, machineId: `m_${id.slice(3)}`, type: "create", state: "succeeded", error: null }),
     findMachine: async (id: string) => machines.get(id) ?? null,
     listMachines: async (md: Record<string, string>) => [...machines.values()].filter((m) => Object.entries(md).every(([k, v]) => m.metadata?.[k] === v)),
+    me: async () => ({ login: "test", manualLifecycle: false, alwaysOnAllowed: true, idleChoicesSeconds: [300, 600, 900, 1200, 1500, 1800] }),
+    getSecrets: async () => {
+      calls.push("secrets-get");
+      return { secrets: "all", envSecrets: [], directSecrets: [], items: [], version: 1, guest: { state: "applied" }, proxy: { state: "applied" } };
+    },
+    updateSecrets: async (_id: string, body: { secrets?: string }) => {
+      calls.push(`secrets-update ${body.secrets}`);
+      return { secrets: "all", envSecrets: [], directSecrets: [], items: [], version: 1, guest: { state: "pending" }, proxy: { state: "pending" } };
+    },
+    pushSecrets: async () => {
+      calls.push("secrets-push");
+      return { secrets: "all", envSecrets: [], directSecrets: [], items: [], version: 1, guest: { state: "applied" }, proxy: { state: "applied" } };
+    },
     deleteMachine: async (id: string) => {
       calls.push(`delete ${id}`);
       machines.delete(id);
@@ -55,12 +74,12 @@ function fakeApi() {
     },
     exec: async () => ({ stdout: "ok\n", stderr: "", exitCode: 0, timedOut: false, truncated: false }),
   };
-  return { api: api as unknown as InstaboxApi, machines, calls };
+  return { api: api as unknown as InstaboxApi, machines, calls, createBodies };
 }
 
 function opsWith(api: InstaboxApi, intents = new Map<string, unknown>()) {
   return new InstaboxMachineOps({
-    config: async () => ({ api, template: "agent-browser", snapshotId: null, agentEnv: {}, opencodeProviders: [] }),
+    config: async () => ({ api, template: "agent-browser", snapshotId: null, autoSuspendAfterSeconds: 300, opencodeProviders: [] }),
     tunnels: { ensure: async () => {}, stop: () => {} } as unknown as TunnelManager,
     boxHubPort: 38886,
     bootstrap: async () => ({ hostId: "host_1" }),
@@ -79,7 +98,7 @@ function opsWith(api: InstaboxApi, intents = new Map<string, unknown>()) {
 const progress = { step() {}, log() {} };
 
 test("a retried create reuses the recorded machine instead of allocating another", async () => {
-  const { api, machines, calls } = fakeApi();
+  const { api, machines, calls, createBodies } = fakeApi();
   const intents = new Map<string, unknown>();
   const ops = opsWith(api, intents);
   const a = await ops.create("key-1", null, async () => {}, progress, new AbortController().signal);
@@ -87,6 +106,11 @@ test("a retried create reuses the recorded machine instead of allocating another
   assert.equal(b.resource.machineId, a.resource.machineId);
   assert.equal(calls.filter((c) => c.startsWith("create")).length, 1);
   assert.equal(machines.size, 1);
+  // API creates select no org Secrets unless asked; every machine gets all proxy Secrets.
+  assert.equal(createBodies.length, 1);
+  assert.equal(createBodies[0].secrets, "all");
+  assert.equal(createBodies[0].autoSuspendAfterSeconds, 300);
+  assert.equal(calls.filter((c) => c === "secrets-get").length, 2);
 });
 
 test("cleanup by key deletes only machines labelled with that key", async () => {
@@ -115,35 +139,45 @@ test("OpenCode sync builds providers from live /models, keeps keys out of the fi
   const home = mkdtempSync(join(tmpdir(), "ib-oc-"));
   mkdirSync(join(home, ".config/bb-instabox"), { recursive: true });
   const key = "k1 $(touch pwned) `id`";
-  writeFileSync(join(home, ".config/bb-instabox/agent.env"), agentEnvContent({ ZAI_API_KEY: key }));
+  writeFileSync(join(home, ".config/bb-instabox/secrets.env"), `ZAI_API_KEY=${key}
+`);
   const providers = JSON.stringify([
     { id: "zai", name: "Z", baseURL: base, keyEnv: "ZAI_API_KEY" },
     { id: "zro", name: "ZRO", baseURL: base, keyEnv: "ZRO_API_KEY" },
   ]);
   const run = () =>
     new Promise<string>((resolve, reject) => {
-      const c = execFile("bash", ["-c", opencodeSyncScript()], { cwd: home, env: { HOME: home, PATH: process.env.PATH } }, (e, out) => (e ? reject(e) : resolve(out.trim().split("\n").pop() ?? "")));
+      const c = execFile("bash", ["-c", opencodeSyncScript()], { cwd: home, env: { HOME: home, PATH: process.env.PATH } }, (e, out) => (e ? reject(e) : resolve(out.trim())));
       c.stdin!.end(providers);
     });
   const file = join(home, ".config/opencode/opencode.json");
+  const piFile = join(home, ".pi/agent/models.json");
 
-  assert.match(await run(), /^opencode-config=written zai:2 zro:skip-no-key restarted=0$/);
+  const first = await run();
+  assert.match(first, /^opencode-config=written zai:2 zro:skip-no-key$/m);
+  assert.match(first, /^pi-models=written zai:2 zro:skip-no-key restarted=0$/m);
   const cfg = JSON.parse(readFileSync(file, "utf8"));
   assert.deepEqual(Object.keys(cfg.provider), ["zai"]);
   assert.deepEqual(Object.keys(cfg.provider.zai.models), ["glm-a", "glm-b"]);
   assert.equal(cfg.provider.zai.options.apiKey, "{env:ZAI_API_KEY}");
   assert.ok(!readFileSync(file, "utf8").includes("k1"), "key must not be written");
+  const piCfg = JSON.parse(readFileSync(piFile, "utf8"));
+  assert.deepEqual(Object.keys(piCfg.providers), ["zai"]);
+  assert.deepEqual(piCfg.providers.zai.models.map((m: { id: string }) => m.id), ["glm-a", "glm-b"]);
+  assert.ok(!readFileSync(piFile, "utf8").includes("k1"), "key must not be written to pi models");
   assert.deepEqual(seen, [`Bearer ${key}`], "key is passed verbatim, never shell-expanded");
   assert.ok(!existsSync(join(home, "pwned")));
 
   status = 500;
-  assert.match(await run(), /zai:2-kept\(http 500\)/);
+  const failed = await run();
+  assert.match(failed, /zai:2-kept\(http 500\)/);
+  assert.match(failed, /^pi-models=unchanged zai:2-kept\(http 500\)/m);
   assert.deepEqual(Object.keys(JSON.parse(readFileSync(file, "utf8")).provider.zai.models), ["glm-a", "glm-b"]);
 
   // A user's own files are never touched: a normal config, one without providers, and JSONC.
   for (const mine of ['{"provider":{"x":{"name":"mine"}}}', '{"theme":"dark"}', '// mine\n{"theme":"dark"}']) {
     writeFileSync(file, mine);
-    assert.equal(await run(), "opencode-config=kept-user-file restarted=0");
+    assert.match(await run(), /^opencode-config=kept-user-file(?: |$)/m);
     assert.equal(readFileSync(file, "utf8"), mine);
   }
 });
@@ -153,7 +187,7 @@ test("OpenCode sync still owns its file after writing one with no providers", as
   const file = join(home, ".config/opencode/opencode.json");
   const run = (providers: string) =>
     new Promise<string>((resolve, reject) => {
-      const c = execFile("bash", ["-c", opencodeSyncScript()], { cwd: home, env: { HOME: home, PATH: process.env.PATH } }, (e, out) => (e ? reject(e) : resolve(out.trim().split("\n").pop() ?? "")));
+      const c = execFile("bash", ["-c", opencodeSyncScript()], { cwd: home, env: { HOME: home, PATH: process.env.PATH } }, (e, out) => (e ? reject(e) : resolve(out.trim())));
       c.stdin!.end(providers);
     });
   // No key anywhere: the plugin writes a config with no providers.
@@ -162,11 +196,55 @@ test("OpenCode sync still owns its file after writing one with no providers", as
   assert.match(await run("[]"), /^opencode-config=unchanged/);
   // Once the user edits it, it is theirs.
   writeFileSync(file, '{"theme":"dark"}');
-  assert.match(await run("[]"), /^opencode-config=kept-user-file/);
+  assert.match(await run("[]"), /^opencode-config=kept-user-file/m);
+});
+
+test("OpenCode sync takes over the template's own opencode.json and keeps its MCP servers", async () => {
+  const home = mkdtempSync(join(tmpdir(), "ib-oc-"));
+  const file = join(home, ".config/opencode/opencode.json");
+  mkdirSync(join(home, ".config/opencode"), { recursive: true });
+  // Byte-for-byte what /usr/local/lib/instabox/data-init.d/opencode writes at boot.
+  const template = `{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+  "mcp": {
+    "open-computer-use": {
+      "type": "local",
+      "command": ["/usr/local/bin/instabox-computer-use", "mcp"]
+    },
+    "instabox": {
+      "type": "local",
+      "command": ["/usr/local/bin/instabox-mcp", "mcp"]
+    }
+  }
+}
+`;
+  assert.ok(OPENCODE_TEMPLATE_HASHES.includes(createHash("sha256").update(template).digest("hex")), "template hash matches the fixture");
+  const run = () =>
+    new Promise<string>((resolve, reject) => {
+      const c = execFile("bash", ["-c", opencodeSyncScript()], { cwd: home, env: { HOME: home, PATH: process.env.PATH } }, (e, out) => (e ? reject(e) : resolve(out.trim())));
+      c.stdin!.end("[]");
+    });
+  // Fresh machine (no opencode.owned) and after a reboot that rewrote the file over ours.
+  for (let i = 0; i < 2; i++) {
+    writeFileSync(file, template);
+    assert.match(await run(), /^opencode-config=written/);
+    const cfg = JSON.parse(readFileSync(file, "utf8"));
+    assert.deepEqual(Object.keys(cfg.mcp), ["open-computer-use", "instabox"]);
+    assert.equal(cfg.autoupdate, false);
+    assert.deepEqual(cfg.provider, {});
+  }
+  // A template-shaped file the user edited is theirs.
+  writeFileSync(file, template.replace("false", "true"));
+  assert.match(await run(), /^opencode-config=kept-user-file/m);
 });
 
 test("parseOpencodeProviders defaults when empty and rejects unsafe entries", () => {
-  assert.ok(parseOpencodeProviders("").some((p) => p.id === "zai-coding-plan"));
+  const defaults = parseOpencodeProviders("");
+  assert.equal(defaults.length, 8);
+  assert.ok(defaults.some((p) => p.id === "zai-coding-plan" && p.keyEnv === "ZAI_API_KEY"));
+  assert.ok(defaults.some((p) => p.id === "zro" && p.keyEnv === "ZRO_API_KEY"));
+  assert.ok(defaults.some((p) => p.id === "coralbricks" && p.keyEnv === "CORALBRICKS_API_KEY"));
   assert.deepEqual(parseOpencodeProviders('[{"id":"zro","baseURL":"https://zro.moonmath.ai/v1/","keyEnv":"ZRO_API_KEY"}]'), [
     { id: "zro", name: "zro", baseURL: "https://zro.moonmath.ai/v1", keyEnv: "ZRO_API_KEY" },
   ]);

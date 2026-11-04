@@ -64,25 +64,55 @@ echo "tunnel=failed reason=not-listening"; exit 1
 `;
 }
 
+/** Where the InstaBox guest agent installs the selected org Secrets (placeholders, not values). */
+export const GUEST_SECRETS_FILE = "/run/instabox/secrets/env";
+
 /**
- * Agent credentials for the bb daemon, from stdin (KEY=value lines), applied to
- * every bb-host-daemon-*.service through a prefix drop-in. Restarts running
- * daemon units only when the content changed. Last line:
- * `agent-env=ok vars=<n> changed=yes|no restarted=<n>`.
+ * Give the bb daemons the machine's InstaBox Secret environment: the org proxy
+ * Secret placeholders (ZAI_API_KEY, GH_TOKEN, …) and whatever proxy settings
+ * the guest file carries. The guest file is shell syntax, so it is sourced in a
+ * clean bash and re-written as plain NAME=value lines for systemd and for the
+ * Pi/OpenCode sync. No stdin, no key values from the hub, and nothing for
+ * Claude Code, Codex or Grok Build. Also removes the agent env file and drop-in
+ * of older plugin versions. Restarts running daemon units only when something
+ * changed. Last line: `secrets-env=ok vars=<n> skipped=<n> changed=yes|no restarted=<n>`.
  */
-export function agentEnvScript(): string {
+export function secretsEnvScript(): string {
   return `set -euo pipefail
 umask 077
-mkdir -p "${CONF}" "$HOME/.config/systemd/user/bb-host-daemon-.service.d"
-f="${CONF}/agent.env"
-new=$(mktemp "${CONF}/.agent.env.XXXXXX")
-cat > "$new"
+src="\${BB_INSTABOX_SECRETS_FILE:-${GUEST_SECRETS_FILE}}"
+dropins="$HOME/.config/systemd/user/bb-host-daemon-.service.d"
+mkdir -p "${CONF}" "$dropins"
+# The guest agent writes the file shortly after Secrets are applied.
+for i in $(seq 1 15); do [ -s "$src" ] && break; sleep 2; done
+f="${CONF}/secrets.env"
+new=$(mktemp "${CONF}/.secrets.env.XXXXXX")
+skipped=0
+if [ -s "$src" ]; then
+  out=$(env -i HOME="$HOME" PATH=/usr/bin:/bin bash -c '
+    declare -A before
+    for n in $(compgen -e); do before[$n]="\${!n}"; done
+    set -a; . "$1" >/dev/null 2>&1; set +a
+    for n in $(compgen -e); do
+      case "$n" in PWD|OLDPWD|SHLVL|_) continue;; esac
+      v="\${!n}"
+      # Only what the guest file set (a login profile may add its own variables).
+      if [ -n "\${before[$n]+x}" ] && [ "\${before[$n]}" = "$v" ]; then continue; fi
+      case "$v" in *[[:cntrl:]]*|*\\"*|*\\'"'"'*|*\\\\*) echo "SKIP"; continue;; esac
+      printf "%s=%s\\n" "$n" "$v"
+    done' _ "$src")
+  skipped=$(printf '%s\\n' "$out" | grep -c '^SKIP$' || true)
+  printf '%s\\n' "$out" | grep -v '^SKIP$' | grep . > "$new" || true
+fi
 changed=yes
 if cmp -s "$new" "$f"; then changed=no; rm -f "$new"; else mv -f "$new" "$f"; fi
-d="$HOME/.config/systemd/user/bb-host-daemon-.service.d/20-bb-instabox-agent-env.conf"
+d="$dropins/20-bb-instabox-secrets-env.conf"
 want='[Service]
-EnvironmentFile=-%h/.config/bb-instabox/agent.env'
+EnvironmentFile=-%h/.config/bb-instabox/secrets.env'
 if [ "$(cat "$d" 2>/dev/null)" != "$want" ]; then printf '%s\\n' "$want" > "$d"; changed=yes; fi
+for old in "$dropins/20-bb-instabox-agent-env.conf" "${CONF}/agent.env"; do
+  if [ -e "$old" ]; then rm -f "$old"; changed=yes; fi
+done
 systemctl --user daemon-reload
 restarted=0
 if [ "$changed" = yes ]; then
@@ -90,7 +120,7 @@ if [ "$changed" = yes ]; then
     systemctl --user restart "$u" && restarted=$((restarted + 1))
   done
 fi
-echo "agent-env=ok vars=$(grep -c . "$f") changed=$changed restarted=$restarted"
+echo "secrets-env=ok vars=$(grep -c . "$f" || true) skipped=$skipped changed=$changed restarted=$restarted"
 `;
 }
 
@@ -111,6 +141,35 @@ done
 [ -d "$HOME/.bb-machines" ] && { rm -rf "$HOME/.bb-machines"; n=$((n + 1)); }
 systemctl --user daemon-reload
 echo "identity=clean removed=$n"
+`;
+}
+
+/**
+ * Stop the bb daemon completely before a pause and before re-enrolling after
+ * one. bb tells the daemon to shut down when it suspends a machine, but the
+ * draining process can outlive its unit and keep the daemon's local port; if
+ * the VM is paused then, it holds the port for a minute or more after resume
+ * and the restarted daemon fails with EADDRINUSE until bb gives up. The units
+ * restart via bootstrap. Last line: `daemon=stopped units=<n> killed=<n>`.
+ */
+export function daemonStopScript(): string {
+  return `set -uo pipefail
+units=0
+for u in $(systemctl --user list-units 'bb-host-daemon-*.service' --all --no-legend --plain 2>/dev/null | awk '{print $1}'); do
+  systemctl --user stop "$u" >/dev/null 2>&1 && units=$((units + 1))
+done
+ports=$(grep -ohE 'host-daemon-port "?[0-9]+' "$HOME"/.config/systemd/user/bb-host-daemon-*.service 2>/dev/null | grep -oE '[0-9]+$' | sort -u)
+# The [p] keeps this script's own command line from matching.
+stale() {
+  { pgrep -u "$(id -u)" -f 'bin/bb-ap[p] host-daemon' || true
+    for p in $ports; do ss -Hltnp "sport = :$p" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2; done; } | sort -u
+}
+pids=$(stale)
+killed=$(printf '%s' "$pids" | grep -c . || true)
+[ -n "$pids" ] && kill -TERM $pids 2>/dev/null
+for i in $(seq 1 20); do [ -z "$(stale)" ] && break; sleep 0.5; done
+left=$(stale); [ -n "$left" ] && kill -KILL $left 2>/dev/null
+echo "daemon=stopped units=$units killed=$killed"
 `;
 }
 
@@ -146,6 +205,10 @@ export const DEFAULT_OPENCODE_PROVIDERS: OpencodeProvider[] = [
   { id: "zro", name: "ZRO", baseURL: "https://zro.moonmath.ai/v1", keyEnv: "ZRO_API_KEY" },
   { id: "coralbricks", name: "Coral Bricks", baseURL: "https://inference.coralbricks.ai/v1", keyEnv: "CORALBRICKS_API_KEY" },
   { id: "neuralwatt", name: "Neuralwatt", baseURL: "https://api.neuralwatt.com/v1", keyEnv: "NEURALWATT_API_KEY" },
+  { id: "deepseek", name: "DeepSeek", baseURL: "https://api.deepseek.com/v1", keyEnv: "DEEPSEEK_API_KEY" },
+  { id: "hypercharm", name: "HyperCharm", baseURL: "https://hyper.charm.land/v1", keyEnv: "HYPERCHARM_API_KEY" },
+  { id: "singularity", name: "Singularity", baseURL: "https://api.singularityapi.dev/v1", keyEnv: "SINGULARITY_API_KEY" },
+  { id: "runinfra", name: "RunInfra", baseURL: "https://api.runinfra.ai/v1", keyEnv: "RUNINFRA_GATEWAY_KEY" },
 ];
 
 /** Parse and check the `opencodeProviders` setting (JSON array). Empty: the defaults. */
@@ -173,6 +236,14 @@ export function parseOpencodeProviders(raw: string): OpencodeProvider[] {
   });
 }
 
+/**
+ * sha256 of the opencode.json that the agent-browser template's boot script
+ * (/usr/local/lib/instabox/data-init.d/opencode) writes: MCP servers only, no
+ * providers. Treated as plugin-owned so the provider config is restored after
+ * the template rewrites the file.
+ */
+export const OPENCODE_TEMPLATE_HASHES = ["04d90801733559c22bae7883d070c8e3fea5a2f3e16821fd27322b7caaa30029"];
+
 /** Marks a provider entry as written by this plugin (so a user's own opencode.json is never overwritten). */
 export const OPENCODE_MARK = "(bb-plugin-instabox)";
 
@@ -182,23 +253,29 @@ export const OPENCODE_MARK = "(bb-plugin-instabox)";
  * and build an @ai-sdk/openai-compatible provider entry from the returned ids
  * (apiKey stays "{env:NAME}", so no secret is written). A failed fetch keeps
  * that provider's models from the previous file. Leaves a user-owned file alone.
- * Last line: `opencode-config=written|unchanged|kept-user-file <id>:<n|skip-reason> …`.
+ * Last lines: `opencode-config=written|unchanged|kept-user-file …` and
+ * `pi-models=written|unchanged|kept-user-file …`.
  */
 export const OPENCODE_SYNC_JS = String.raw`
 const fs = require("node:fs"), path = require("node:path");
-const file = process.env.OPENCODE_CONFIG_FILE || path.join(process.env.HOME, ".config/opencode/opencode.json");
+const home = process.env.HOME;
+const file = process.env.OPENCODE_CONFIG_FILE || path.join(home, ".config/opencode/opencode.json");
+const piFile = path.join(home, ".pi/agent/models.json");
 const MARK = ${JSON.stringify(OPENCODE_MARK)};
 const providers = JSON.parse(fs.readFileSync(0, "utf8"));
-// The daemon's agent env (KEY=value lines, as written by agentEnvScript); parsed, never sourced by a shell.
+// Keys: the machine's InstaBox Secret placeholders as written by secretsEnvScript
+// (plain NAME=value lines; parsed, never sourced by a shell).
 const env = { ...process.env };
 try {
-  for (const line of fs.readFileSync(path.join(process.env.HOME, ".config/bb-instabox/agent.env"), "utf8").split("\n")) {
+  for (const line of fs.readFileSync(path.join(home, ".config/bb-instabox/secrets.env"), "utf8").split("\n")) {
     const i = line.indexOf("=");
     if (i > 0) env[line.slice(0, i)] = line.slice(i + 1);
   }
 } catch {}
-// Ownership: the sha256 of exactly what this plugin last wrote, kept beside the agent env.
-// The config is ours only if it is missing, matches that hash, or (older plugin) carries MARK.
+// Ownership: the sha256 of exactly what this plugin last wrote. The config is
+// ours only if it is missing, matches that hash, is a file the InstaBox
+// template itself writes at boot (TEMPLATE_HASHES), or (older plugin) carries MARK.
+const TEMPLATE_HASHES = ${JSON.stringify(OPENCODE_TEMPLATE_HASHES)};
 const crypto = require("node:crypto");
 const ownFile = path.join(process.env.HOME, ".config/bb-instabox/opencode.owned");
 const sha = (t) => crypto.createHash("sha256").update(t).digest("hex");
@@ -206,15 +283,40 @@ let raw = null, prev = null, owned = null;
 try { raw = fs.readFileSync(file, "utf8"); } catch {}
 try { prev = JSON.parse(raw); } catch {}
 try { owned = fs.readFileSync(ownFile, "utf8").trim(); } catch {}
-const ours = raw === null || (owned !== null && owned === sha(raw)) ||
+const ours = raw === null || (owned !== null && owned === sha(raw)) || (raw !== null && TEMPLATE_HASHES.includes(sha(raw))) ||
   (owned === null && prev !== null && Object.values(prev.provider || {}).some((p) => String(p && p.name).endsWith(MARK)));
-const report = [];
+const report = [], piReport = [];
+const piOwnFile = path.join(home, ".config/bb-instabox/pi-models.owned");
+let piRaw = null, piPrev = null, piOwned = null;
+try { piRaw = fs.readFileSync(piFile, "utf8"); } catch {}
+try { piPrev = JSON.parse(piRaw); } catch {}
+try { piOwned = fs.readFileSync(piOwnFile, "utf8").trim(); } catch {}
+const piOurs = piRaw === null || (piOwned !== null && piOwned === sha(piRaw));
+// Keep everything else in the file (the template's MCP servers, autoupdate); only "provider" is ours.
+const { provider: _oldProvider, ...base } = ours && prev && typeof prev === "object" ? prev : {};
+const out = { $schema: "https://opencode.ai/config.json", ...base, provider: {} };
+const piOut = { providers: {} };
+function save(f, text, own, current, mode) {
+  let state = "unchanged";
+  if (current !== text) {
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    const tmp = f + ".tmp" + process.pid;
+    fs.writeFileSync(tmp, text, { mode });
+    fs.renameSync(tmp, f);
+    state = "written";
+  }
+  fs.mkdirSync(path.dirname(own), { recursive: true });
+  const hash = sha(text) + "\n";
+  let have = null;
+  try { have = fs.readFileSync(own, "utf8"); } catch {}
+  if (have !== hash) fs.writeFileSync(own, hash, { mode: 0o600 });
+  return state;
+}
 (async () => {
-  if (!ours) { console.log("opencode-config=kept-user-file"); return; }
-  const out = { $schema: "https://opencode.ai/config.json", provider: {} };
   for (const p of providers) {
+    const piId = p.id === "zai-coding-plan" ? "zai" : p.id;
     const key = env[p.keyEnv];
-    if (!key) { report.push(p.id + ":skip-no-key"); continue; }
+    if (!key) { report.push(p.id + ":skip-no-key"); piReport.push(p.id + ":skip-no-key"); continue; }
     let ids = null;
     try {
       const r = await fetch(p.baseURL + "/models", { headers: { Authorization: "Bearer " + key }, signal: AbortSignal.timeout(15000) });
@@ -224,8 +326,22 @@ const report = [];
       if (!ids.length) throw new Error("empty");
     } catch (e) {
       const old = prev && prev.provider && prev.provider[p.id] && prev.provider[p.id].models;
-      if (old && Object.keys(old).length) { ids = Object.keys(old); report.push(p.id + ":" + ids.length + "-kept(" + e.message + ")"); }
-      else { report.push(p.id + ":skip-" + String(e.message).replace(/\s+/g, "-")); continue; }
+      const oldPi = piPrev && piPrev.providers && piPrev.providers[piId] && piPrev.providers[piId].models;
+      if (old && Object.keys(old).length) {
+        // Keep the last good list rather than dropping the provider on a transient failure.
+        out.provider[p.id] = prev.provider[p.id];
+        report.push(p.id + ":" + Object.keys(old).length + "-kept(" + e.message + ")");
+        if (Array.isArray(oldPi) && oldPi.length) {
+          piOut.providers[piId] = piPrev.providers[piId];
+          piReport.push(piId + ":" + oldPi.length + "-kept(" + e.message + ")");
+        } else {
+          piReport.push(piId + ":skip-" + String(e.message).replace(/\s+/g, "-"));
+        }
+      } else {
+        report.push(p.id + ":skip-" + String(e.message).replace(/\s+/g, "-"));
+        piReport.push(p.id + ":skip-" + String(e.message).replace(/\s+/g, "-"));
+      }
+      continue;
     }
     if (!report.some((x) => x.startsWith(p.id + ":"))) report.push(p.id + ":" + ids.length);
     out.provider[p.id] = {
@@ -234,22 +350,23 @@ const report = [];
       options: { baseURL: p.baseURL, apiKey: "{env:" + p.keyEnv + "}" },
       models: Object.fromEntries(ids.map((id) => [id, { name: id }])),
     };
+    const oldPi = piPrev && piPrev.providers && piPrev.providers[piId] && Array.isArray(piPrev.providers[piId].models) ? piPrev.providers[piId].models : [];
+    const piModels = ids.map((id) => {
+      const old = oldPi.find((m) => m && m.id === id);
+      return old ? { ...old, id, name: old.name || id } : { id, name: id };
+    });
+    piOut.providers[piId] = piId === "zai"
+      ? { ...(piPrev && piPrev.providers && piPrev.providers.zai ? piPrev.providers.zai : {}), models: piModels }
+      : { baseUrl: p.baseURL, api: "openai-completions", apiKey: "$" + p.keyEnv, models: piModels };
+    if (!piReport.some((x) => x.startsWith(piId + ":"))) piReport.push(piId + ":" + piModels.length);
   }
-  const text = JSON.stringify(out, null, 2) + "\n";
-  let state = "unchanged";
-  if (raw !== text) {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = file + ".tmp" + process.pid;
-    fs.writeFileSync(tmp, text, { mode: 0o644 });
-    fs.renameSync(tmp, file);
-    state = "written";
-  }
-  if (owned !== sha(text)) {
-    fs.mkdirSync(path.dirname(ownFile), { recursive: true });
-    fs.writeFileSync(ownFile, sha(text) + "\n", { mode: 0o600 });
-  }
-  console.log("opencode-config=" + state + " " + report.join(" "));
-})().catch((e) => { console.log("opencode-config=failed " + e.message); process.exit(1); });
+  const ocText = JSON.stringify(out, null, 2) + "\n";
+  const piText = JSON.stringify(piOut, null, 2) + "\n";
+  const ocState = ours ? save(file, ocText, ownFile, raw, 0o644) : "kept-user-file";
+  const piState = piOurs ? save(piFile, piText, piOwnFile, piRaw, 0o600) : "kept-user-file";
+  console.log("opencode-config=" + ocState + " " + report.join(" "));
+  console.log("pi-models=" + piState + " " + piReport.join(" "));
+})().catch((e) => { console.log("agent-config=failed " + e.message); process.exit(1); });
 `;
 
 /**
@@ -267,10 +384,10 @@ cat > "$js" <<'BB_OPENCODE_SYNC_EOF'
 ${OPENCODE_SYNC_JS}
 BB_OPENCODE_SYNC_EOF
 out=$(PATH=/usr/local/bin:$PATH node "$js")
-# bb caches each provider's model list until its daemon restarts; restart it only when the config changed.
+# bb caches each provider's model list until its daemon restarts; restart it only when a config changed.
 restarted=0
 case "$out" in
-  opencode-config=written*)
+  *opencode-config=written*|*pi-models=written*)
     for u in $(systemctl --user list-units 'bb-host-daemon-*.service' --state=running --no-legend --plain 2>/dev/null | awk '{print $1}'); do
       systemctl --user restart "$u" && restarted=$((restarted + 1))
     done;;
@@ -282,35 +399,4 @@ echo "$out restarted=$restarted"
 /** Exit 0 when the hub answers /health on the box's loopback end of the tunnel. */
 export function hubHealthScript(boxHubPort: number): string {
   return `curl -fsS -m 5 -o /dev/null http://127.0.0.1:${boxHubPort}/health`;
-}
-
-/**
- * The `agentSecrets` setting: a one-line JSON object of NAME → string value
- * (bb secret settings cannot be multi-line). Empty means none. Throws on
- * anything else; names and values are checked again by agentEnvContent.
- */
-export function parseAgentSecrets(raw: string): Record<string, string> {
-  if (!raw.trim()) return {};
-  let v: unknown;
-  try {
-    v = JSON.parse(raw);
-  } catch {
-    throw new Error('agentSecrets must be a JSON object, e.g. {"GH_TOKEN":"…"}');
-  }
-  if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("agentSecrets must be a JSON object");
-  for (const [k, x] of Object.entries(v)) if (typeof x !== "string") throw new Error(`agentSecrets.${k} must be a string`);
-  const out = v as Record<string, string>;
-  agentEnvContent(out);
-  return out;
-}
-
-/** KEY=value lines for the agent env file. Values must be single-line. */
-export function agentEnvContent(vars: Record<string, string>): string {
-  return Object.entries(vars)
-    .map(([k, v]) => {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`bad env name ${k}`);
-      if (/[\r\n]/.test(v)) throw new Error(`env ${k} must be one line`);
-      return `${k}=${v}\n`;
-    })
-    .join("");
 }

@@ -4,12 +4,16 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2023", "DOM"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": ["node"],
     "noEmit": true,
-    "skipLibCheck": true,
+    "skipLibCheck": false,
     "allowImportingTsExtensions": true,
-    "erasableSyntaxOnly": true
+    "erasableSyntaxOnly": true,
+    "jsx": "react-jsx",
+    "paths": {
+      "@/*": ["./*"]
+    }
   },
-  "include": ["server.ts", "src", "test"]
+  "include": ["server.ts", "app.tsx", "src", "ui", "test", "components", "lib", "hooks"]
 }
