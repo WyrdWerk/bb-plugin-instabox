@@ -13,6 +13,8 @@ import type { ExecResultDto, MachineDto, OverviewDto, SnapshotDto, TemplateDto }
 import { ActionDialog, type DialogSpec, type DialogValues } from "./dialogs.tsx";
 import { ago, idleText, labelsText, parseLabels, suggestSnapshotName } from "./format.ts";
 import { AccountSection, MachinesSection, RunCommandSection, SnapshotsSection, TemplatesSection, type MachineAction } from "./sections.tsx";
+import { ImportSection } from "./ImportSection.tsx";
+import { NO_PROJECTS_TEXT } from "./NoProjectsHint.tsx";
 import { ProjectsSection } from "./ProjectsSection.tsx";
 import { useIdleChoices, useInstaboxOverview, useInstaboxRunning, useProjectNames } from "./useInstabox.ts";
 
@@ -273,7 +275,7 @@ export function InstaboxPage(_props: PluginNavPanelProps) {
           label: "Project (bb runners only)",
           initial: "",
           options: [{ value: "", label: "None" }, ...projectNames.map((n) => ({ value: n, label: n }))],
-          hint: "Clones each repo of the project at its branch into ~/workspace/repos and registers it as a bb project source on the runner.",
+          hint: projectNames.length === 0 ? NO_PROJECTS_TEXT : "Clones each repo of the project at its branch into ~/workspace/repos and registers it as a bb project source on the runner.",
         },
       ],
       run: async (v) => {
@@ -392,6 +394,7 @@ export function InstaboxPage(_props: PluginNavPanelProps) {
               onDelete={(s) => open(deleteSnapshot(s))}
             />
             <ProjectsSection />
+            <ImportSection />
             <TemplatesSection data={data} onNew={(t) => open(createMachine({ template: t }))} />
             <RunCommandSection data={data} result={execResult} onRun={(id, cmd, t) => open(runCommand(id, cmd, t))} onClear={() => setExecResult(null)} />
           </>

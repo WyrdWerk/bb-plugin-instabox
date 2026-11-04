@@ -116,6 +116,7 @@ Per-project secrets: `printf %s "$VALUE" | bb machine env set NAME --project <pr
 | `opencodeProviders` | the eight org-Secret providers below | JSON array `[{"id","name"?,"baseURL","keyEnv"}]` of OpenAI-compatible providers for Pi and OpenCode (see [Keys on runners](#keys-on-runners)) |
 | `githubOwners` | empty | Comma list of GitHub owners for the Projects repo picker. Empty: `WyrdWerk` plus the account `gh` on the hub is logged in as |
 | `createMissingProjects` | off | Project runners: create a bb project for a cloned repo whose remote matches none |
+| `hubCheckoutDir` | empty (`~/bb-github`) | Import from GitHub: where the hub keeps the checkouts of imported projects. An existing `<dir>/<repo>` whose origin is that repo is reused; otherwise the repo is cloned there (`<dir>/<owner>/<repo>` when `<dir>/<repo>` holds another repo) |
 | `boxHubPort` | `38886` | Port of the tunnel on each machine (the InstaBox tunnel access hands machines `http://127.0.0.1:<port>`); reload the plugin after changing it |
 
 Environment compositions `instabox` (git worktree) and `instabox-checkout`
@@ -227,6 +228,24 @@ is only reported.
 Private repos clone through the machine's `GH_TOKEN` org Secret placeholder, offered by a
 one-off `git -c credential.helper=…` for that clone only; InstaBox's proxy swaps in the
 real token. Nothing is written into the remote URL or any git config.
+
+### Import from GitHub
+
+bb's New thread Project picker lists bb projects. **InstaBox page → Import from GitHub**
+lists the repos `gh` on the hub sees for `githubOwners` and marks those that already are
+bb projects (same git remote). Tick the others and **Import**. bb creates projects only
+from a checkout on a machine and reads the GitHub remote from it, so each import:
+
+1. reuses `<hubCheckoutDir>/<repo>` when its `origin` is that repo, or clones it there.
+   The clone uses the hub's `gh` login through a one-off credential helper, so no token
+   goes into the remote URL or git config. When `<hubCheckoutDir>/<repo>` holds another
+   repo (say a same-named repo of another owner), `<hubCheckoutDir>/<owner>/<repo>` is
+   used the same way; if both hold something else, the import is refused.
+2. creates the bb project from that path on the hub, then waits until bb has recorded
+   the GitHub remote. An import is reported as failed if bb never records it.
+
+Repos that already are bb projects are skipped, and nothing is deleted from this screen.
+InstaBox runners then clone the project from GitHub, not from the hub's checkout.
 
 ## The InstaBox page
 

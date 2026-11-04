@@ -7,6 +7,7 @@ import { Icon } from "@/components/ui/icon";
 import type { JsonValue, PluginMachineProviderInputsProps } from "@get-bb/plugin-sdk/app";
 import { Input } from "@/components/ui/input";
 import { idleText } from "./format.ts";
+import { NoProjectsHint } from "./NoProjectsHint.tsx";
 import { useIdleChoices, useProjectNames } from "./useInstabox.ts";
 
 export function InstaboxMachineInputs({ value, onChange }: PluginMachineProviderInputsProps) {
@@ -80,7 +81,11 @@ export function InstaboxMachineInputs({ value, onChange }: PluginMachineProvider
               ))}
               {project !== "" && !projectNames.includes(project) ? <option value={project}>{project}</option> : null}
             </select>
-            <span className="text-xs text-muted-foreground">Clones each repo of the project (InstaBox page → Projects) at its branch into ~/workspace/repos and registers it as a bb project source on the new runner.</span>
+            {projectNames.length === 0 ? (
+              <NoProjectsHint link />
+            ) : (
+              <span className="text-xs text-muted-foreground">Clones each repo of the project (InstaBox page → Projects) at its branch into ~/workspace/repos and registers it as a bb project source on the new runner.</span>
+            )}
           </label>
           <label className="flex flex-col gap-1">
             <span>Snapshot id (optional)</span>

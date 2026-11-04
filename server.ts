@@ -7,7 +7,10 @@
 // plugin registers the "InstaBox tunnel" machine access for it (bb setting
 // defaultMachineAccess instabox-tunnel). See README.md.
 import { execFile } from "node:child_process";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import type { BbPluginApi, JsonValue } from "@get-bb/plugin-sdk";
 import { DEFAULT_API_URL, InstaboxApi, type FetchLike, isRunning } from "./src/instabox-api.ts";
@@ -18,6 +21,7 @@ import { ActivityLeases, IdleWatch } from "./src/activity.ts";
 import { createDashboardHandlers, dashboardRpc, INSTABOX_CHANGED } from "./src/dashboard.ts";
 import { createRepoLister, type GhRun, resolveOwners } from "./src/github-repos.ts";
 import { ProjectStore } from "./src/project-store.ts";
+import { hubCloneArgs, importListing, importRepo } from "./src/github-import.ts";
 
 const COMPOSITIONS = [
   {
@@ -85,6 +89,12 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Create bb projects for unmatched repos",
       description: "When a repo cloned for a project runner matches no bb project by git remote, create a bb project from the clone on the runner. Off: the clone is left unregistered (logged).",
       default: false,
+    },
+    hubCheckoutDir: {
+      type: "string",
+      label: "Hub checkout directory (Import from GitHub)",
+      description: "Absolute directory on this bb server for the checkouts of repos imported as bb projects (InstaBox page → Import from GitHub). An existing <dir>/<repo> whose origin is that repo is reused; otherwise the repo is cloned there with the server's gh login (no token stored), or into <dir>/<owner>/<repo> when <dir>/<repo> holds another repo. Empty: ~/bb-github.",
+      default: "",
     },
     boxHubPort: {
       type: "number",
@@ -197,6 +207,64 @@ export default async function plugin(bb: BbPluginApi) {
       }),
   });
   type BbProject = { id: string; name: string; gitRemoteUrl: string | null; sources?: { hostId: string; path: string }[] };
+
+  // Import from GitHub: bb projects backed by checkouts on the hub (bb creates
+  // projects only from a local path, and reads the git remote from it).
+  const git = (args: string[], cwd?: string) =>
+    new Promise<string>((resolve, reject) => {
+      execFile("git", args, { cwd, timeout: 600_000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }, (err, stdout, stderr) =>
+        err ? reject(new Error(String(stderr).trim().split("\n").pop() || err.message)) : resolve(String(stdout)),
+      );
+    });
+  const checkoutDir = async () => {
+    const d = ((await settings.get()).hubCheckoutDir ?? "").trim();
+    return d.startsWith("/") ? d : join(homedir(), "bb-github");
+  };
+  const bbProjects = async () => ((await bb.sdk.projects.list()) as unknown as BbProject[]).map((p) => ({ id: p.id, name: p.name, gitRemoteUrl: p.gitRemoteUrl }));
+  const githubImport = {
+    async list(force: boolean) {
+      const r = await github.repos(force);
+      if (r.status !== "ok") return r;
+      return { status: "ok" as const, checkoutDir: await checkoutDir(), repos: importListing(r.repos, await bbProjects()) };
+    },
+    async run(repos: { owner: string; name: string }[]) {
+      const listed = await github.repos(false);
+      const hostId = (await bb.sdk.system.config()).primaryHostId;
+      const dir = await checkoutDir();
+      const results = [];
+      for (const r of repos) {
+        // Only repos the picker offers (configured owners, visible to gh).
+        if (listed.status !== "ok" || !listed.repos.some((x) => x.owner.toLowerCase() === r.owner.toLowerCase() && x.name === r.name)) {
+          results.push({ repo: `${r.owner}/${r.name}`, status: "failed" as const, message: "not in the repo list for the configured GitHub owners" });
+          continue;
+        }
+        if (!hostId) {
+          results.push({ repo: `${r.owner}/${r.name}`, status: "failed" as const, message: "bb has no primary host to keep the checkout on" });
+          continue;
+        }
+        const res = await importRepo(
+          { owner: r.owner, name: r.name, url: `https://github.com/${r.owner}/${r.name}.git` },
+          {
+            checkoutDir: dir,
+            listProjects: bbProjects,
+            originOf: async (path) => {
+              if (!existsSync(path)) return null;
+              return (await git(["-C", path, "remote", "get-url", "origin"]).catch(() => "")).trim();
+            },
+            clone: async (url, path) => {
+              await mkdir(dirname(path), { recursive: true });
+              await git(hubCloneArgs(url, path));
+            },
+            createProject: async ({ name, path }) => ({ id: ((await bb.sdk.projects.create({ name, source: { type: "local_path", hostId, path } })) as unknown as { id: string }).id }),
+            sleep: (ms) => new Promise((ok) => setTimeout(ok, ms)),
+          },
+        );
+        bb.log.info(`github import ${res.repo}: ${res.status}${res.status === "created" ? ` (${res.checkout} checkout ${res.path}, ${res.projectId})` : res.status === "failed" ? ` (${res.message})` : ""}`);
+        results.push(res);
+      }
+      return results;
+    },
+  };
 
   const intentKey = (key: string) => `alloc/${key}`;
   const ops = new InstaboxMachineOps({
@@ -425,6 +493,7 @@ export default async function plugin(bb: BbPluginApi) {
       hubWarning,
       projectStore,
       github,
+      githubImport,
     }),
   );
 

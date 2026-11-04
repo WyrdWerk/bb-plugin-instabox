@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input";
 import type { DashboardRpc } from "../src/dashboard.ts";
 import { checkRepoForm, filterRepos, ownerRepo, type PickerRepo, repoNameFromUrl } from "./projects-ui.ts";
 import { SectionFrame } from "./sections.tsx";
+import { NO_PROJECTS_TEXT } from "./NoProjectsHint.tsx";
 import { INSTABOX_CHANGED } from "./useInstabox.ts";
 
 type Branches = { status: "idle" } | { status: "loading" } | { status: "ok"; defaultBranch: string | null; branches: string[] } | { status: "unavailable"; reason: string };
@@ -147,7 +148,7 @@ export function ProjectsSection() {
         ~/workspace/repos and registers each as a bb project source on that machine.
       </p>
       {projects === null ? null : projects.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground">No projects yet.</div>
+        <div className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground">{NO_PROJECTS_TEXT}: use New project above.</div>
       ) : (
         <ul className="divide-y divide-border rounded-lg border border-border bg-card">
           {projects.map((p) => (
