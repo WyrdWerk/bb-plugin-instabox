@@ -2,15 +2,16 @@
 //
 // Experimental. Same shape as bb-plugin-boat, but the box → hub route needs no
 // Tailscale and no relay: the hub holds an SSH local forward through InstaBox's
-// gateway plus a chisel reverse tunnel (src/tunnel.ts). bb's direct machine
-// access must point machines at that tunnel: `machineServerUrl
-// http://127.0.0.1:<boxHubPort>` (default 38886). See README.md.
+// gateway plus a chisel reverse tunnel (src/tunnel.ts). Machines must be handed
+// that tunnel's loopback URL http://127.0.0.1:<boxHubPort> (default 38886): the
+// plugin registers the "InstaBox tunnel" machine access for it (bb setting
+// defaultMachineAccess instabox-tunnel). See README.md.
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { z } from "zod";
 import type { BbPluginApi, JsonValue } from "@get-bb/plugin-sdk";
 import { DEFAULT_API_URL, InstaboxApi, type FetchLike, isRunning } from "./src/instabox-api.ts";
-import { type AllocationIntent, InstaboxMachineOps, inputsSchema, PROVIDER_ID, type ProviderConfig, resourceSchema } from "./src/provider.ts";
+import { ACCESS_PROVIDER_ID, type AllocationIntent, InstaboxMachineOps, inputsSchema, PROVIDER_ID, type ProviderConfig, resourceSchema, tunnelGrant } from "./src/provider.ts";
 import { TunnelManager } from "./src/tunnel.ts";
 import { parseOpencodeProviders } from "./src/box-scripts.ts";
 import { ActivityLeases, IdleWatch } from "./src/activity.ts";
@@ -34,6 +35,8 @@ const COMPOSITIONS = [
 ] as const;
 
 const SUPERVISE_MS = 30_000;
+/** This plugin's bb id (from the package name bb-plugin-instabox); bb keys machine-access grants by it. */
+const PLUGIN_ID = "instabox";
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
@@ -86,7 +89,7 @@ export default async function plugin(bb: BbPluginApi) {
     boxHubPort: {
       type: "number",
       label: "Hub port on the machine's loopback",
-      description: "The tunnel opens this port on each machine. bb's machineServerUrl must be http://127.0.0.1:<this port>. Changing it needs a plugin reload.",
+      description: "The tunnel opens this port on each machine. The InstaBox tunnel machine access hands machines http://127.0.0.1:<this port>. Changing it needs a plugin reload.",
       default: 38886,
     },
   });
@@ -117,21 +120,39 @@ export default async function plugin(bb: BbPluginApi) {
     return c;
   }
 
-  /** Setup problems a user can fix: missing key, or bb not pointing machines at the tunnel. */
+  /**
+   * bb hands machines the tunnel URL through this plugin's "InstaBox tunnel"
+   * access, or through the older direct setting with the loopback URL. Both
+   * connect machines; the older one also makes bb's web UI disable Send for new
+   * InstaBox machines (it treats a loopback URL as unreachable), so it only
+   * works from the CLI.
+   */
+  async function accessState(): Promise<"tunnel" | "legacy" | "wrong"> {
+    const access = (await bb.sdk.system.config()).serverAccess;
+    if (access.defaultProviderId === ACCESS_PROVIDER_ID) return "tunnel";
+    return access.defaultProviderId === "direct" && access.effectiveUrl === tunnelUrl ? "legacy" : "wrong";
+  }
+  const chooseTunnel = `In Settings → Machines → Machine access choose "InstaBox tunnel", or run: bb settings general defaultMachineAccess ${ACCESS_PROVIDER_ID}`;
+
+  /** Problems that stop machines from connecting: missing key, or bb not handing machines the tunnel. */
   async function setupProblem(): Promise<string | null> {
     const c = await configOrError();
     if ("error" in c) return c.error;
-    const access = (await bb.sdk.system.config()).serverAccess;
-    if (access.defaultProviderId !== "direct" || access.effectiveUrl !== tunnelUrl) {
-      return `InstaBox machines reach this hub through a tunnel at ${tunnelUrl}. Run: bb settings general defaultMachineAccess direct && bb settings general machineServerUrl ${tunnelUrl}`;
-    }
-    return null;
+    return wrongAccess();
   }
 
-  async function hubWarning(): Promise<string | null> {
+  async function wrongAccess(): Promise<string | null> {
+    if ((await accessState()) !== "wrong") return null;
     const access = (await bb.sdk.system.config()).serverAccess;
-    if (access.defaultProviderId === "direct" && access.effectiveUrl === tunnelUrl) return null;
-    return `bb is handing machines ${access.effectiveUrl ?? "(no URL)"} (${access.defaultProviderId ?? "no provider"}), not the InstaBox tunnel ${tunnelUrl}. New InstaBox runners will not connect until you run: bb settings general defaultMachineAccess direct && bb settings general machineServerUrl ${tunnelUrl}`;
+    return `bb is handing machines ${access.effectiveUrl ?? "(no URL)"} (${access.defaultProviderId ?? "no provider"}), not the InstaBox tunnel ${tunnelUrl}. ${chooseTunnel}`;
+  }
+
+  /** For the InstaBox page: also flags the older setting that only works from the CLI. */
+  async function hubWarning(): Promise<string | null> {
+    if ((await accessState()) === "legacy") {
+      return `Machine access is "Manual" with ${tunnelUrl}. Machines connect, but bb's New thread screen treats a loopback address as unreachable and disables Send for InstaBox machines. ${chooseTunnel}`;
+    }
+    return wrongAccess();
   }
 
   const authKey = (machineId: string) => `tunnel-auth/${machineId}`;
@@ -257,6 +278,23 @@ export default async function plugin(bb: BbPluginApi) {
         return { status: "failed", message: `InstaBox remove failed: ${message(err)}` };
       }
     },
+  });
+
+  // Machine access: hands InstaBox machines the tunnel's loopback URL. Make it
+  // the default with `bb settings general defaultMachineAccess instabox-tunnel`.
+  bb.experimental_serverAccess.register({
+    id: ACCESS_PROVIDER_ID,
+    displayName: "InstaBox tunnel",
+    description: `InstaBox machines reach this hub through the plugin's SSH tunnel at ${tunnelUrl} on the machine. Other machines are refused.`,
+    async availability() {
+      const c = await configOrError();
+      return "error" in c ? { status: "setup-required", message: c.error } : { status: "available", serverUrl: tunnelUrl };
+    },
+    async acquire({ key, hostId }) {
+      return tunnelGrant(PLUGIN_ID, key, hostId, tunnelUrl);
+    },
+    // Nothing to release: the tunnel is torn down with the machine.
+    async release() {},
   });
 
   for (const c of COMPOSITIONS) bb.experimental_environments.register({ ...c, icon: "./instabox.svg", machineProviderId: PROVIDER_ID });

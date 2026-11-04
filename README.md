@@ -59,13 +59,22 @@ masked after saving. There is no environment-variable or command-line way to sup
 until it is set, the plugin and the InstaBox page show "setup required" pointing to that
 settings page.
 
-Then point machines at the tunnel; the plugin shows "setup required" with this exact
-command until it is done:
+Then hand machines the tunnel: in **Settings → Machines → Machine access** choose
+**InstaBox tunnel** (it saves at once), or run:
 
 ```bash
-bb settings general defaultMachineAccess direct
-bb settings general machineServerUrl http://127.0.0.1:38886
+bb settings general defaultMachineAccess instabox-tunnel
 ```
+
+The plugin registers this machine access. It gives InstaBox machines the tunnel's
+loopback URL `http://127.0.0.1:38886` and refuses machines from other providers. Until
+it is chosen, bb shows "Machines cannot reach this bb yet" on the plugin's settings page
+and in New thread, and disables Send for InstaBox environments.
+
+The older setup, `defaultMachineAccess direct` with `machineServerUrl
+http://127.0.0.1:38886`, still connects machines, but bb's web UI treats a loopback URL
+as unreachable, so it shows that banner and disables Send for new machines. Only the
+CLI works with it.
 
 ### 4. A basic runner snapshot (recommended)
 
@@ -87,6 +96,14 @@ bb thread spawn --project <projectId> --environment-provider instabox --provider
 bb machine remove <hostId> --yes
 ```
 
+In the web UI: **New thread → pick a project** (bb lists environments only for a
+project), then in the environment picker choose **InstaBox machine** (Git worktree) or
+**InstaBox machine (project checkout)**. A **Repos: …** button appears next to it, with
+the plugin project to clone (see [Project runners](#project-runners)), a snapshot
+override and the idle pause. Pick a provider the runner is logged in to: Pi and
+OpenCode work out of the box; Claude Code, Codex and Grok Build need a manual login on
+each machine first.
+
 Per-project secrets: `printf %s "$VALUE" | bb machine env set NAME --project <projectId>`
 (encrypted by bb, passed to that project's machines on each turn).
 
@@ -99,7 +116,7 @@ Per-project secrets: `printf %s "$VALUE" | bb machine env set NAME --project <pr
 | `opencodeProviders` | the eight org-Secret providers below | JSON array `[{"id","name"?,"baseURL","keyEnv"}]` of OpenAI-compatible providers for Pi and OpenCode (see [Keys on runners](#keys-on-runners)) |
 | `githubOwners` | empty | Comma list of GitHub owners for the Projects repo picker. Empty: `WyrdWerk` plus the account `gh` on the hub is logged in as |
 | `createMissingProjects` | off | Project runners: create a bb project for a cloned repo whose remote matches none |
-| `boxHubPort` | `38886` | Must match `machineServerUrl`; reload the plugin after changing it |
+| `boxHubPort` | `38886` | Port of the tunnel on each machine (the InstaBox tunnel access hands machines `http://127.0.0.1:<port>`); reload the plugin after changing it |
 
 Environment compositions `instabox` (git worktree) and `instabox-checkout`
 (project checkout) appear in the environment picker. One command creates a box,

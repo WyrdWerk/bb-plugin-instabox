@@ -404,3 +404,26 @@ export class InstaboxMachineOps {
 function lastLine(s: string) {
   return s.trim().split("\n").pop() ?? "";
 }
+
+/** bb's server-access provider id for the InstaBox tunnel (hub setting defaultMachineAccess). */
+export const ACCESS_PROVIDER_ID = "instabox-tunnel";
+
+/**
+ * The grant for one machine: InstaBox machines reach the hub at the tunnel's
+ * loopback port. bb passes `key` as JSON [ownerPluginId, launchKey] for machines
+ * a plugin provider created; any other machine (enrolled by hand, another
+ * provider) is refused, since the loopback URL means nothing there.
+ */
+export function tunnelGrant(pluginId: string, key: string, hostId: string, tunnelUrl: string): { id: string; serverUrl: string } | { status: "failed"; message: string } {
+  let owner: unknown = null;
+  try {
+    const parsed: unknown = JSON.parse(key);
+    if (Array.isArray(parsed)) owner = parsed[0];
+  } catch {
+    // not a plugin-created machine
+  }
+  if (owner !== pluginId) {
+    return { status: "failed", message: "The InstaBox tunnel only connects InstaBox machines. Pick another machine access for this machine in Settings → Machines." };
+  }
+  return { id: `instabox-tunnel:${hostId}`, serverUrl: tunnelUrl };
+}

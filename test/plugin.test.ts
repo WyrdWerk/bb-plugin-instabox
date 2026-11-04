@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { OPENCODE_TEMPLATE_HASHES, opencodeSyncScript, parseOpencodeProviders, secretsEnvScript } from "../src/box-scripts.ts";
 import { shellQuote } from "../src/executor.ts";
 import type { InstaboxApi, Machine, Operation } from "../src/instabox-api.ts";
-import { InstaboxMachineOps, metadataFor, type ProjectsDeps } from "../src/provider.ts";
+import { InstaboxMachineOps, metadataFor, type ProjectsDeps, tunnelGrant } from "../src/provider.ts";
 import type { TunnelManager } from "../src/tunnel.ts";
 
 test("shellQuote: bash sees exactly the original argv", () => {
@@ -287,4 +287,13 @@ test("parseOpencodeProviders defaults when empty and rejects unsafe entries", ()
   assert.throws(() => parseOpencodeProviders('[{"id":"x","baseURL":"http://a.b/v1","keyEnv":"K"}]'));
   assert.throws(() => parseOpencodeProviders('[{"id":"x","baseURL":"https://u:p@a.b/v1","keyEnv":"K"}]'));
   assert.throws(() => parseOpencodeProviders('[{"id":"x","baseURL":"https://a.b/v1","keyEnv":"K;rm"}]'));
+});
+
+test("the InstaBox tunnel access grants the loopback URL only to machines this plugin created", () => {
+  const url = "http://127.0.0.1:38886";
+  assert.deepEqual(tunnelGrant("instabox", JSON.stringify(["instabox", "launch-1"]), "host_a", url), { id: "instabox-tunnel:host_a", serverUrl: url });
+  for (const key of [JSON.stringify(["boat", "launch-1"]), "host_a", "not json", JSON.stringify({ 0: "instabox" })]) {
+    const g = tunnelGrant("instabox", key, "host_a", url);
+    assert.ok("status" in g && g.status === "failed", key);
+  }
 });
