@@ -182,6 +182,21 @@ const repoListDto = z.discriminatedUnion("status", [
   }),
   z.object({ status: z.literal("unavailable"), reason: z.string() }),
 ]);
+const importListDto = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("ok"),
+    checkoutDir: z.string(),
+    repos: z.array(
+      z.object({ owner: z.string(), name: z.string(), url: z.string(), isPrivate: z.boolean(), bbProject: z.object({ id: z.string(), name: z.string() }).nullable() }),
+    ),
+  }),
+  z.object({ status: z.literal("unavailable"), reason: z.string() }),
+]);
+const importResultDto = z.discriminatedUnion("status", [
+  z.object({ repo: z.string(), status: z.literal("exists"), projectId: z.string(), projectName: z.string() }),
+  z.object({ repo: z.string(), status: z.literal("created"), projectId: z.string(), path: z.string(), checkout: z.enum(["existing", "cloned"]), gitRemoteUrl: z.string() }),
+  z.object({ repo: z.string(), status: z.literal("failed"), message: z.string() }),
+]);
 const branchListDto = z.discriminatedUnion("status", [
   z.object({ status: z.literal("ok"), defaultBranch: z.string().nullable(), branches: z.array(z.string()) }),
   z.object({ status: z.literal("unavailable"), reason: z.string() }),
@@ -198,6 +213,12 @@ export const dashboardRpc = defineRpcContract({
   project_repo_remove: { input: z.object({ project: z.string(), repoName: z.string() }), output: projectDto },
   repos_list: { input: z.object({ refresh: z.boolean() }), output: repoListDto },
   repo_branches: { input: z.object({ owner: z.string(), repo: z.string(), refresh: z.boolean() }), output: branchListDto },
+  // Import from GitHub: create bb projects (hub checkouts) for picked repos.
+  github_import_list: { input: z.object({ refresh: z.boolean() }), output: importListDto },
+  github_import: {
+    input: z.object({ repos: z.array(z.object({ owner: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/), name: z.string().regex(/^[A-Za-z0-9._-]{1,100}$/) })).min(1).max(20) }),
+    output: z.object({ results: z.array(importResultDto) }),
+  },
   instabox_overview: { input: z.null(), output: overviewDto },
   instabox_summary: { input: z.null(), output: z.object({ running: z.number().nullable(), total: z.number().nullable() }) },
   instabox_idle_choices: { input: z.null(), output: idleChoicesDto },
@@ -280,6 +301,10 @@ export interface DashboardDeps {
   hubWarning?(): Promise<string | null>;
   cacheMs?: number;
   projectStore?: ProjectStore;
+  githubImport?: {
+    list(force: boolean): Promise<z.infer<typeof importListDto>>;
+    run(repos: { owner: string; name: string }[]): Promise<z.infer<typeof importResultDto>[]>;
+  };
   github?: { repos(force: boolean): Promise<RepoListResult>; branches(owner: string, repo: string, force: boolean): Promise<BranchListResult> };
 }
 
@@ -570,6 +595,16 @@ export function createDashboardHandlers(deps: DashboardDeps) {
     project_repo_remove: async ({ project, repoName }: { project: string; repoName: string }) => withStore((s) => s.removeRepo(project, repoName)),
     repos_list: async ({ refresh }: { refresh: boolean }) => github().repos(refresh),
     repo_branches: async ({ owner, repo, refresh }: { owner: string; repo: string; refresh: boolean }) => github().branches(owner, repo, refresh),
+    github_import_list: async ({ refresh }: { refresh: boolean }) => {
+      if (!deps.githubImport) throw new Error("Import from GitHub is not available in this plugin build");
+      return deps.githubImport.list(refresh);
+    },
+    github_import: async ({ repos }: { repos: { owner: string; name: string }[] }) => {
+      if (!deps.githubImport) throw new Error("Import from GitHub is not available in this plugin build");
+      const results = await deps.githubImport.run(repos);
+      changed();
+      return { results };
+    },
 
     instabox_overview: async () => overview(),
 
